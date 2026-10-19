@@ -9,11 +9,19 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Default read-only permissions for all jobs; jobs needing writes opt in.
+# Combined with persist-credentials: false on every checkout to prevent
+# a compromised step or fork from exfiltrating GITHUB_TOKEN or persisting it.
+permissions:
+  contents: read
+
 jobs:
   format_and_lint:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
@@ -43,6 +51,8 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
@@ -68,6 +78,8 @@ jobs:
     continue-on-error: true
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
@@ -89,11 +101,80 @@ jobs:
       continue-on-error: true
       run: cargo audit
 
+  # ---------------------------------------------------------------------------
+  # Supply-chain guardrails (added after the 2026-10-18 incident in which
+  # obfuscated JavaScript was committed as "public/fonts/fa-solid-500.woff2").
+  #
+  # Both jobs are cheap: stdlib Python only, no network, no Rust toolchain.
+  # Neither job declares `needs`, so they run in parallel with the existing
+  # pipeline and fail the run if either guard reports a problem.
+  # ---------------------------------------------------------------------------
+
+  asset-integrity:
+    name: asset integrity (font magic bytes)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Validate tracked font assets
+      run: python3 scripts/guard/guard_assets.py --root .
+
+  vscode-config-guard:
+    name: vscode auto-task guard
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Reject dangerous VS Code auto-task configuration
+      run: python3 scripts/guard/guard_vscode_config.py --root .
+
+  guardrail-tests:
+    name: guardrail fixture tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Run guardrail fixture tests
+      run: bash tests/guard/run_fixture_tests.sh
+
+    - name: Incident payload regression (static bytes only)
+      run: python3 tests/guard/test_incident_payload.py
+
+  devcontainer-guard:
+    name: devcontainer auto-run guard
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Reject risky dev-container auto-run configuration
+      run: python3 scripts/guard/guard_devcontainer.py --root .
+
+  npm-lifecycle-guard:
+    name: npm lifecycle hook guard
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Reject risky package.json lifecycle hooks
+      run: python3 scripts/guard/guard_npm_lifecycle.py --root .
+
   install-script:
     name: install-script validation
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
     - name: Syntax check (no network)
       run: bash -n install.sh
     - name: ShellCheck (if available)
@@ -106,10 +187,34 @@ jobs:
     - name: Offline self-test (checksum standalone plus embedded fallback)
       run: bash install.sh --selftest
 
+  # ARM64 Linux is a supported release target (see release.yml matrix), so the
+  # installer must work on that architecture and the two must not drift apart.
+  install-script-arm:
+    name: install-script validation (aarch64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Syntax check (no network)
+      run: bash -n install.sh
+    - name: Offline self-test on aarch64
+      run: bash install.sh --selftest
+    - name: Release matrix and installer agree on aarch64 target
+      run: |
+        TARGET="aarch64-unknown-linux-gnu"
+        grep -q "target: $TARGET" .github/workflows/release.yml \
+          || { echo "FAIL: release.yml matrix has no $TARGET target"; exit 1; }
+        grep -q "$TARGET" install.sh \
+          || { echo "FAIL: install.sh does not reference $TARGET"; exit 1; }
+        echo "OK: release.yml and install.sh both cover $TARGET"
+
   msrv:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     # Parse MSRV from Cargo.toml or fallback
     - name: Set up Rust (MSRV)
@@ -122,11 +227,41 @@ jobs:
     - name: Check MSRV
       run: cargo check --workspace
 
+  # Current-release documentation must track the workspace version: stale pins
+  # in getting-started, compatibility and Action examples mislead a fresh
+  # developer. Historical release notes (docs/releases/) are exempt.
+  docs-version-consistency:
+    name: docs version consistency
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+    - name: Current docs describe the workspace version
+      run: |
+        VER="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)".*/\1/')"
+        echo "workspace version: $VER"
+        PREV="$(printf '%s' "$VER" | awk -F. '{printf "%s.%s.0", $1, $2-1}')"
+        echo "stale pin to look for: $PREV"
+        # crates.io legitimately lags: lines that name crates.io may state the
+        # older version, so exclude them explicitly.
+        MATCHES="$(grep -rn "$PREV" README.md docs/ --include='*.md' \
+          | grep -v '^docs/releases/' \
+          | grep -vi 'crates.io\|published\|--version \|lacks\|predates\|older v' || true)"
+        if [[ -n "$MATCHES" ]]; then
+          echo "::error::stale $PREV reference(s) in current documentation:"
+          echo "$MATCHES"
+          exit 1
+        fi
+        echo "OK: no stale $PREV pins outside crates.io notes and release history"
+
   onboarding-smoke:
     name: offline onboarding smoke test
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
 
     - name: Set up Rust
       uses: dtolnay/rust-toolchain@stable
@@ -138,3 +273,73 @@ jobs:
 
     - name: Run committed offline example smoke test
       run: bash scripts/smoke_examples.sh
+
+  playground-wasm:
+    name: playground WASM freshness
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@1.88.0
+      with:
+        targets: wasm32-unknown-unknown
+
+    - name: Install wasm-bindgen CLI
+      run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+
+    - name: Show toolchain versions
+      run: |
+        git rev-parse HEAD
+        rustc -Vv
+        cargo -V
+        wasm-bindgen --version
+
+    - name: Check sdkt-playground
+      run: cargo check --locked --manifest-path crates/sdkt-playground/Cargo.toml --target wasm32-unknown-unknown
+
+    - name: Build playground WASM
+      run: |
+        cargo build --locked \
+          --release \
+          --target wasm32-unknown-unknown \
+          --manifest-path crates/sdkt-playground/Cargo.toml
+
+    - name: Show raw playground WASM hash
+      run: |
+        sha256sum crates/sdkt-playground/target/wasm32-unknown-unknown/release/sdkt_playground.wasm
+
+    - name: Generate playground artifacts
+      run: |
+        tmp_dir="$(mktemp -d)"
+        echo "PLAYGROUND_WASM_OUT=$tmp_dir" >> "$GITHUB_ENV"
+
+        wasm-bindgen \
+          --target web \
+          --no-typescript \
+          --out-dir "$tmp_dir" \
+          crates/sdkt-playground/target/wasm32-unknown-unknown/release/sdkt_playground.wasm
+
+    - name: Check committed artifacts are fresh
+      run: |
+        echo "Committed generated WASM:"
+        sha256sum website/playground/wasm/sdkt_playground_bg.wasm
+
+        echo "Generated WASM:"
+        sha256sum "$PLAYGROUND_WASM_OUT/sdkt_playground_bg.wasm"
+
+        echo "Committed generated JS:"
+        sha256sum website/playground/wasm/sdkt_playground.js
+
+        echo "Generated JS:"
+        sha256sum "$PLAYGROUND_WASM_OUT/sdkt_playground.js"
+
+        cmp website/playground/wasm/sdkt_playground_bg.wasm \
+          "$PLAYGROUND_WASM_OUT/sdkt_playground_bg.wasm"
+
+        cmp website/playground/wasm/sdkt_playground.js \
+          "$PLAYGROUND_WASM_OUT/sdkt_playground.js"
+
+        echo "Playground WASM artifacts are up to date."

@@ -15,6 +15,9 @@
 //! - `file`: string (basename only, not absolute path)
 //! - `metadata.hash`: hex string
 //! - `metadata.size_bytes`: u64
+//! - `metadata.contract_meta`: array of {key, value} decoded from the
+//!   `contractmetav0` custom section, in section order with duplicates
+//!   preserved. Empty array when the WASM carries no such section.
 //! - `spec`: object with functions/events/custom_types arrays
 //!
 //! ### `sdkt diff --upgrade-safety --format json`
@@ -29,10 +32,33 @@
 //! ### `sdkt package validate --format json`
 //! - `valid`: boolean
 //! - `error`: string (when invalid)
+//!
+//! ### `sdkt storage estimate --format json`
+//! - `wasm_path`: string
+//! - `ledgers`: u32
+//! - `cost_per_entry_stroops`: u64
+//! - `cost_per_entry_xlm`: string
+//! - `classes`: object containing `instance`, `persistent`, and `temporary`
+//!   - `instance`: {entry_count, cost_stroops, cost_xlm, derivation, notes}
+//!   - `persistent`: {entry_count, cost_stroops, cost_xlm, derivation, notes}
+//!   - `temporary`: {entry_count, cost_stroops, cost_xlm, derivation, notes}
+//! - `total`: {baseline_entries, cost_stroops, cost_xlm}
+//! - `spec_metrics`: {functions_count, custom_types_count, events_count}
+//! - `approximation_ceiling`: string
 
 use assert_cmd::Command;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use sdkt_xdr::{encode_ledger_key, LedgerKeyParams};
 use serde_json::Value;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use stellar_xdr::{
+    ContractDataDurability, ContractDataEntry, ContractExecutable, ContractId, ExtensionPoint,
+    Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, Limited, Limits, ScAddress,
+    ScContractInstance, ScVal, WriteXdr,
+};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -59,12 +85,290 @@ fn assert_valid_json(s: &str) -> Value {
     })
 }
 
+/// Assert that a failed `--format json` invocation emitted the documented error
+/// envelope on **stdout**: `{"error": "<message>"}` with exit code 1.
+///
+/// Machine consumers pipe `sdkt <cmd> --format json` into `jq`, so the error
+/// must be machine-parseable on stdout — a prose line on stderr with empty
+/// stdout is a parse failure for them.
+fn assert_error_envelope(output: &std::process::Output, expect_fragment: &str) {
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit, got {:?}",
+        output.status.code()
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "error envelope must exit with code 1"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "stderr must be empty in JSON mode, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed = assert_valid_json(&stdout);
+    let err = parsed
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("envelope missing `error` key: {stdout}"));
+    assert!(
+        err.contains(expect_fragment),
+        "error message should mention `{expect_fragment}`, got: {err}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Compatibility: wasm inspect fixtures (project-local, stable)
 // ---------------------------------------------------------------------------
 
 static WASM_OLD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/us_old.wasm");
 static WASM_NEW: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/us_new.wasm");
+
+const RPC_CONTRACT_ID: &str = "CAE3U7JKESRWZHPEQ72DVNGOQ6WPA7HSPQZL5YV46NPCE4TMUPAGYMEC";
+const RPC_CONTRACT_ID_HEX: &str =
+    "09ba7d2a24a36c9de487f43ab4ce87acf07cf27c32bee2bcf35e22726ca3c06c";
+const RPC_WASM_HASH_HEX: &str = "60cddae67f202c19ee7b000c894fd12aa8b44de09ab652f5e188bc0c63a6cf02";
+
+fn read_rpc_request(sock: &mut TcpStream) -> String {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = sock.read(&mut buf).unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&data);
+        if let Some(end) = text.find("\r\n\r\n") {
+            let len = text[..end]
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= end + 4 + len {
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&data).into_owned()
+}
+
+fn encode_ledger_entry(entry: &LedgerEntry) -> String {
+    let mut bytes = Vec::new();
+    entry
+        .write_xdr(&mut Limited::new(&mut bytes, Limits::none()))
+        .unwrap();
+    STANDARD.encode(bytes)
+}
+
+fn mock_contract_data_xdr() -> String {
+    let mut wasm_hash = [0u8; 32];
+    hex::decode_to_slice(RPC_WASM_HASH_HEX, &mut wasm_hash).unwrap();
+    encode_ledger_entry(&LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(Hash([0; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable: ContractExecutable::Wasm(Hash(wasm_hash)),
+                storage: None,
+            }),
+        }),
+        ext: LedgerEntryExt::V0,
+    })
+}
+
+fn mock_storage_inspect_rpc() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let contract_data_key = encode_ledger_key(&LedgerKeyParams::ContractData(
+        RPC_CONTRACT_ID_HEX.to_string(),
+    ))
+    .unwrap();
+    let contract_data_xdr = mock_contract_data_xdr();
+
+    thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut sock) = conn else { break };
+            let request = read_rpc_request(&mut sock);
+            let body = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap_or("");
+            let request_json: Value = serde_json::from_str(body).unwrap_or_default();
+            let method = request_json["method"].as_str().unwrap_or("");
+            let response = match method {
+                "getLatestLedger" => {
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"id":"mock","protocolVersion":22,"sequence":10000}}"#.to_string()
+                }
+                "getLedgerEntries" => {
+                    let requested: Vec<&str> = request_json["params"]["keys"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    let entries = if requested.contains(&contract_data_key.as_str()) {
+                        serde_json::json!([{
+                            "key": contract_data_key,
+                            "xdr": contract_data_xdr,
+                            "lastModifiedLedgerSeq": 1,
+                            "liveUntilLedgerSeq": 12345
+                        }])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": { "entries": entries, "latestLedger": 10000 }
+                    })
+                    .to_string()
+                }
+                _ => r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#.to_string(),
+            };
+            let http_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            let _ = sock.write_all(http_response.as_bytes());
+        }
+    });
+
+    url
+}
+
+fn run_storage_check(with_abi: bool) -> Value {
+    let rpc_url = mock_storage_inspect_rpc();
+    let mut cmd = sdkt();
+    cmd.args([
+        "storage",
+        "check",
+        RPC_CONTRACT_ID,
+        "--format",
+        "json",
+        "--rpc-url",
+    ])
+    .arg(rpc_url);
+    if with_abi {
+        cmd.arg("--abi").arg(WASM_NEW);
+    }
+    let output = cmd.assert().success().get_output().stdout.clone();
+    assert_valid_json(&String::from_utf8_lossy(&output))
+}
+
+fn run_contract_inspect(with_abi: bool) -> Value {
+    let rpc_url = mock_storage_inspect_rpc();
+    let mut cmd = sdkt();
+    cmd.args(["inspect", RPC_CONTRACT_ID, "--format", "json", "--rpc-url"])
+        .arg(rpc_url);
+    if with_abi {
+        cmd.arg("--abi").arg(WASM_NEW);
+    }
+    let output = cmd.assert().success().get_output().stdout.clone();
+    assert_valid_json(&String::from_utf8_lossy(&output))
+}
+
+fn assert_fields_unchanged(without_abi: &Value, with_abi: &Value, fields: &[&str]) {
+    for field in fields {
+        assert_eq!(
+            without_abi.get(field),
+            with_abi.get(field),
+            "existing field `{field}` changed when --abi was supplied"
+        );
+    }
+}
+
+mod storage_check_json_schema {
+    use super::*;
+
+    #[test]
+    fn abi_adds_metadata_without_changing_ttl_entries() {
+        let without_abi = run_storage_check(false);
+        let with_abi = run_storage_check(true);
+        let existing_fields = ["contract_id", "entries"];
+
+        assert_fields_unchanged(&without_abi, &with_abi, &existing_fields);
+        assert_eq!(
+            without_abi.as_object().unwrap().len(),
+            existing_fields.len()
+        );
+        assert_eq!(
+            with_abi.as_object().unwrap().len(),
+            existing_fields.len() + 1
+        );
+
+        let entries = with_abi["entries"]
+            .as_array()
+            .expect("entries remains an array with --abi");
+        assert!(!entries.is_empty());
+        for field in [
+            "key",
+            "current_ttl",
+            "expiration_time",
+            "days_remaining",
+            "extension_cost_stroops",
+        ] {
+            assert!(
+                entries[0].get(field).is_some(),
+                "missing entry field `{field}`"
+            );
+        }
+
+        assert!(with_abi["abi"]["functions"].is_array());
+        assert!(with_abi["abi"]["events"].is_array());
+        assert!(with_abi["abi"]["custom_types"].is_array());
+    }
+}
+
+mod inspect_json_schema {
+    use super::*;
+
+    #[test]
+    fn abi_adds_full_spec_without_changing_inspection_fields() {
+        let without_abi = run_contract_inspect(false);
+        let with_abi = run_contract_inspect(true);
+        let existing_fields = [
+            "contract_id",
+            "wasm_hash",
+            "wasm_size",
+            "abi",
+            "storage_summary",
+            "ttl_info",
+            "storage_keys",
+        ];
+
+        assert_fields_unchanged(&without_abi, &with_abi, &existing_fields);
+        assert_eq!(
+            without_abi.as_object().unwrap().len(),
+            existing_fields.len()
+        );
+        assert_eq!(
+            with_abi.as_object().unwrap().len(),
+            existing_fields.len() + 1
+        );
+        assert!(
+            with_abi["storage_keys"].is_array(),
+            "storage_keys remains an array with --abi"
+        );
+
+        let abi_spec = with_abi["abi_spec"]
+            .as_object()
+            .expect("abi_spec contains the full supplied ContractSpec");
+        for field in ["env_meta", "functions", "custom_types", "events"] {
+            assert!(
+                abi_spec.contains_key(field),
+                "missing ABI spec field `{field}`"
+            );
+        }
+    }
+}
 
 // ===========================================================================
 // sdkt wasm inspect --format json
@@ -87,6 +391,75 @@ mod wasm_inspect {
         assert!(v.get("file").is_some(), "missing `file` field");
         assert!(v.get("metadata").is_some(), "missing `metadata` field");
         assert!(v.get("spec").is_some(), "missing `spec` field");
+    }
+
+    #[test]
+    fn json_metadata_contract_meta_is_an_additive_key_value_array() {
+        let out = sdkt()
+            .args(["wasm", "inspect", WASM_NEW, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = assert_valid_json(&String::from_utf8_lossy(&out));
+        let meta = v.get("metadata").expect("metadata field");
+
+        let entries = meta
+            .get("contract_meta")
+            .and_then(|m| m.as_array())
+            .expect("metadata.contract_meta should be an array");
+
+        // The committed fixture carries contractmetav0 with SDK/rustc/cli
+        // provenance entries; assert the decoded shape, not a fixed count.
+        assert!(
+            !entries.is_empty(),
+            "us_new.wasm should expose contractmetav0 entries"
+        );
+        for entry in entries {
+            let key = entry.get("key").and_then(|k| k.as_str());
+            let value = entry.get("value").and_then(|val| val.as_str());
+            assert!(key.is_some(), "each entry needs a string `key`: {entry}");
+            assert!(
+                value.is_some(),
+                "each entry needs a string `value`: {entry}"
+            );
+        }
+
+        // Ground truth for this fixture: the SDK/rustc/cli provenance keys.
+        let keys: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e.get("key").and_then(|k| k.as_str()))
+            .collect();
+        for expected in ["rsver", "rssdkver", "cliver"] {
+            assert!(
+                keys.contains(&expected),
+                "expected contract_meta key `{expected}`, got {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_metadata_without_contract_meta_is_an_empty_array() {
+        // us_old.wasm has no contractmetav0: the field must still be present
+        // and empty, so consumers can rely on the key existing.
+        let out = sdkt()
+            .args(["wasm", "inspect", WASM_OLD, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = assert_valid_json(&String::from_utf8_lossy(&out));
+        let entries = v
+            .get("metadata")
+            .and_then(|m| m.get("contract_meta"))
+            .and_then(|m| m.as_array())
+            .expect("metadata.contract_meta should be present and an array");
+        assert!(
+            entries.is_empty(),
+            "us_old.wasm has no contractmetav0, expected [], got {entries:?}"
+        );
     }
 
     #[test]
@@ -123,6 +496,65 @@ mod wasm_inspect {
             meta.get("exports").is_some_and(|e| e.is_array()),
             "metadata.exports should be an array"
         );
+    }
+
+    #[test]
+    fn json_metadata_exports_and_imports_have_stable_lowercase_kind_strings() {
+        let out = sdkt()
+            .args(["wasm", "inspect", WASM_NEW, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = assert_valid_json(&String::from_utf8_lossy(&out));
+        let meta = v.get("metadata").expect("metadata field");
+
+        let exports = meta
+            .get("exports")
+            .and_then(|e| e.as_array())
+            .expect("metadata.exports array");
+        assert!(!exports.is_empty(), "us_new.wasm should have exports");
+        for exp in exports {
+            let kind = exp
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .expect("export kind string");
+            assert!(
+                matches!(
+                    kind,
+                    "func" | "table" | "memory" | "global" | "tag" | "func_exact"
+                ),
+                "export kind should be stable lowercase, got: {kind}"
+            );
+            assert!(
+                !kind.contains('(') && !kind.chars().next().is_some_and(|c| c.is_uppercase()),
+                "export kind must not leak debug or uppercase: {kind}"
+            );
+        }
+
+        let imports = meta
+            .get("imports")
+            .and_then(|i| i.as_array())
+            .expect("metadata.imports array");
+        assert!(!imports.is_empty(), "us_new.wasm should have imports");
+        for imp in imports {
+            let kind = imp
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .expect("import kind string");
+            assert!(
+                matches!(
+                    kind,
+                    "func" | "table" | "memory" | "global" | "tag" | "func_exact"
+                ),
+                "import kind should be stable lowercase without index payload, got: {kind}"
+            );
+            assert!(
+                !kind.contains('(') && !kind.chars().next().is_some_and(|c| c.is_uppercase()),
+                "import kind must not leak debug format like Func(0): {kind}"
+            );
+        }
     }
 
     #[test]
@@ -165,17 +597,17 @@ mod wasm_inspect {
 
     #[test]
     fn json_error_output_is_consistent() {
-        let out = sdkt()
+        let output = sdkt()
             .args(["wasm", "inspect", "/no/such/file.wasm", "--format", "json"])
             .assert()
-            .failure()
             .get_output()
-            .stderr
             .clone();
-        let err_str = String::from_utf8_lossy(&out);
+        assert_error_envelope(&output, "Error reading WASM file");
+        // stderr is intentionally empty for JSON consumers — error is on stdout.
         assert!(
-            err_str.contains("Error") || err_str.contains("No such file"),
-            "error output should mention the failure: {err_str}"
+            output.stderr.is_empty(),
+            "stderr should be empty in JSON mode, got: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
@@ -289,7 +721,7 @@ mod diff_upgrade_safety {
 
     #[test]
     fn json_error_when_old_wasm_missing() {
-        let out = sdkt()
+        let output = sdkt()
             .args([
                 "diff",
                 "--old-wasm",
@@ -301,14 +733,13 @@ mod diff_upgrade_safety {
                 "json",
             ])
             .assert()
-            .failure()
             .get_output()
-            .stderr
             .clone();
-        let err_str = String::from_utf8_lossy(&out);
+        assert_error_envelope(&output, "Failed to read OLD WASM");
         assert!(
-            err_str.contains("Failed to read") || err_str.contains("No such file"),
-            "error should mention missing file: {err_str}"
+            output.stderr.is_empty(),
+            "stderr should be empty in JSON mode, got: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }
@@ -418,18 +849,141 @@ mod audit {
 
     #[test]
     fn json_error_when_source_missing() {
-        let out = sdkt()
+        let output = sdkt()
             .args(["audit", "/no/such/contract.rs", "--format", "json"])
             .assert()
-            .failure()
             .get_output()
-            .stderr
             .clone();
-        let err_str = String::from_utf8_lossy(&out);
+        assert_error_envelope(&output, "Failed to read source");
         assert!(
-            err_str.contains("Failed to read") || err_str.contains("No such file"),
-            "error should mention missing file: {err_str}"
+            output.stderr.is_empty(),
+            "stderr should be empty in JSON mode, got: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn json_error_when_no_rust_files_found() {
+        // A directory containing no .rs files — distinct from a missing file.
+        let dir = TempDir::with_prefix("sdkt-audit-empty").unwrap();
+        let output = sdkt()
+            .args(["audit", dir.path().to_str().unwrap(), "--format", "json"])
+            .assert()
+            .get_output()
+            .clone();
+        assert_error_envelope(&output, "No Rust source files");
+    }
+
+    #[test]
+    fn json_error_when_new_wasm_missing() {
+        let output = sdkt()
+            .args([
+                "diff",
+                "--old-wasm",
+                WASM_OLD,
+                "--new-wasm",
+                "/no/such/new.wasm",
+                "--upgrade-safety",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        assert_error_envelope(&output, "Failed to read NEW WASM");
+        assert!(
+            output.stderr.is_empty(),
+            "stderr should be empty in JSON mode, got: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn json_error_when_wasm_not_a_binary() {
+        // A non-binary file triggers a parse failure, not a read failure.
+        let dir = TempDir::with_prefix("sdkt-diff-bad").unwrap();
+        let fake_wasm = write_fixture(&dir, "fake.wasm", "not a wasm binary");
+        let output = sdkt()
+            .args([
+                "diff",
+                "--old-wasm",
+                fake_wasm.to_str().unwrap(),
+                "--new-wasm",
+                WASM_NEW,
+                "--upgrade-safety",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        assert_error_envelope(&output, "Error diffing WASM");
+    }
+
+    #[test]
+    fn json_error_when_size_policy_combined_with_upgrade_safety() {
+        // Validation failure: --upgrade-safety + --max-size-bytes is rejected.
+        let output = sdkt()
+            .args([
+                "diff",
+                "--old-wasm",
+                WASM_OLD,
+                "--new-wasm",
+                WASM_NEW,
+                "--upgrade-safety",
+                "--max-size-bytes",
+                "1000",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        assert_error_envelope(
+            &output,
+            "size policy cannot be combined with --upgrade-safety",
+        );
+    }
+
+    #[test]
+    fn json_error_when_max_size_bytes_zero() {
+        // Validation failure: --max-size-bytes must be > 0.
+        let output = sdkt()
+            .args([
+                "diff",
+                "--old-wasm",
+                WASM_OLD,
+                "--new-wasm",
+                WASM_NEW,
+                "--max-size-bytes",
+                "0",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        assert_error_envelope(&output, "--max-size-bytes must be greater than 0");
+    }
+
+    #[test]
+    fn json_error_when_max_growth_pct_negative() {
+        // Validation failure: --max-growth-pct must not be negative.
+        let output = sdkt()
+            .args([
+                "diff",
+                "--old-wasm",
+                WASM_OLD,
+                "--new-wasm",
+                WASM_NEW,
+                "--max-growth-pct=-5",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        assert_error_envelope(&output, "--max-growth-pct must not be negative");
     }
 }
 
@@ -495,8 +1049,8 @@ mod decode {
 
     #[test]
     fn json_error_on_invalid_xdr() {
-        // Invalid base64 / truncated XDR → error envelope
-        let out = sdkt()
+        // Invalid base64 / truncated XDR → error envelope on stdout
+        let output = sdkt()
             .args([
                 "decode",
                 "AAAA",
@@ -506,27 +1060,71 @@ mod decode {
                 "json",
             ])
             .assert()
-            .failure()
             .get_output()
-            .stderr
             .clone();
-        let err_str = String::from_utf8_lossy(&out);
+        assert_error_envelope(&output, "XDR parse failed for type 'TransactionEnvelope'");
         assert!(
-            err_str.contains("XdrParse") || err_str.contains("Error"),
-            "error should mention parse failure: {err_str}"
+            output.stderr.is_empty(),
+            "stderr should be empty in JSON mode, got: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
     #[test]
-    fn json_output_is_valid_for_ledger_key_type() {
-        // Use a known-valid base64 LedgerKey (pre-encoded offline).
-        // This is a minimal valid LedgerKey for a AccountEntry.
-        // If this fixture is unavailable, the test still validates JSON shape
-        // by checking that ANY successful decode produces valid JSON.
-        //
-        // Ponytail: add a static base64 fixture here once a stable one is
-        // committed to tests/fixtures/. For now we only assert the error path
-        // above, which is the deterministic offline case.
+    fn json_error_when_file_missing() {
+        let output = sdkt()
+            .args([
+                "decode",
+                "--file",
+                "/no/such/input.xdr",
+                "--type",
+                "TransactionEnvelope",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        // The message must carry the path and the original I/O error, not a
+        // blanket "No such file" that hides which input failed.
+        assert_error_envelope(&output, "Failed to read input file '/no/such/input.xdr'");
+    }
+
+    #[test]
+    fn json_error_when_no_input_provided() {
+        let output = sdkt()
+            .args([
+                "decode",
+                "--type",
+                "TransactionEnvelope",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        assert_error_envelope(&output, "no input provided");
+    }
+
+    #[test]
+    fn pretty_mode_error_still_goes_to_stderr() {
+        // Non-JSON mode keeps the human-readable contract: stderr, not stdout.
+        let output = sdkt()
+            .args(["decode", "AAAA", "--type", "TransactionEnvelope"])
+            .assert()
+            .get_output()
+            .clone();
+        assert!(!output.status.success());
+        assert!(
+            output.stdout.is_empty(),
+            "stdout should be empty in pretty mode, got: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.is_empty(),
+            "stderr should carry the error in pretty mode: {stderr}"
+        );
     }
 }
 
@@ -586,5 +1184,146 @@ mod cross_cutting {
             .stdout
             .clone();
         assert_valid_json(&String::from_utf8_lossy(&out));
+
+        // storage estimate
+        let out = sdkt()
+            .args(["storage", "estimate", WASM_OLD, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        assert_valid_json(&String::from_utf8_lossy(&out));
+    }
+}
+
+// ===========================================================================
+// sdkt storage estimate --format json
+// ===========================================================================
+
+mod storage_estimate {
+    use super::*;
+
+    #[test]
+    fn json_output_has_required_top_level_fields() {
+        let out = sdkt()
+            .args(["storage", "estimate", WASM_OLD, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = assert_valid_json(&String::from_utf8_lossy(&out));
+
+        assert!(v.get("wasm_path").is_some(), "missing `wasm_path`");
+        assert!(v.get("ledgers").is_some(), "missing `ledgers`");
+        assert!(
+            v.get("cost_per_entry_stroops").is_some(),
+            "missing `cost_per_entry_stroops`"
+        );
+        assert!(
+            v.get("cost_per_entry_xlm").is_some(),
+            "missing `cost_per_entry_xlm`"
+        );
+        assert!(v.get("classes").is_some(), "missing `classes`");
+        assert!(v.get("total").is_some(), "missing `total`");
+        assert!(v.get("spec_metrics").is_some(), "missing `spec_metrics`");
+        assert!(
+            v.get("approximation_ceiling").is_some(),
+            "missing `approximation_ceiling`"
+        );
+    }
+
+    #[test]
+    fn json_classes_breakdown_schema_and_types() {
+        let out = sdkt()
+            .args(["storage", "estimate", WASM_OLD, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = assert_valid_json(&String::from_utf8_lossy(&out));
+        let classes = v.get("classes").expect("classes object");
+
+        for class_name in ["instance", "persistent", "temporary"] {
+            let class_obj = classes.get(class_name).unwrap_or_else(|| {
+                panic!("missing `{class_name}` class object");
+            });
+
+            assert!(
+                class_obj.get("entry_count").is_some_and(|c| c.is_u64()),
+                "{class_name}: entry_count should be u64"
+            );
+            assert!(
+                class_obj.get("cost_stroops").is_some_and(|c| c.is_u64()),
+                "{class_name}: cost_stroops should be u64"
+            );
+            assert!(
+                class_obj.get("cost_xlm").is_some_and(|c| c.is_string()),
+                "{class_name}: cost_xlm should be string"
+            );
+            assert!(
+                class_obj.get("derivation").is_some_and(|c| c.is_string()),
+                "{class_name}: derivation should be string"
+            );
+            assert!(
+                class_obj.get("notes").is_some_and(|c| c.is_string()),
+                "{class_name}: notes should be string"
+            );
+        }
+
+        // Specific values for us_old.wasm (guaranteed instance singleton baseline; persistent is unknown from ABI alone)
+        assert_eq!(classes["instance"]["entry_count"], 1);
+        assert_eq!(classes["persistent"]["entry_count"], 0);
+        assert_eq!(classes["temporary"]["entry_count"], 0);
+
+        let total = v.get("total").expect("total object");
+        assert_eq!(total["baseline_entries"], 1);
+        assert_eq!(total["cost_stroops"], 1728000);
+        assert_eq!(total["cost_xlm"], "0.1728");
+
+        let metrics = v.get("spec_metrics").expect("spec_metrics object");
+        assert_eq!(metrics["functions_count"], 2);
+        assert_eq!(metrics["custom_types_count"], 1);
+        assert_eq!(metrics["events_count"], 1);
+    }
+
+    #[test]
+    fn json_custom_ledgers_scales_cost() {
+        let out = sdkt()
+            .args([
+                "storage",
+                "estimate",
+                WASM_NEW,
+                "--ledgers",
+                "100",
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v = assert_valid_json(&String::from_utf8_lossy(&out));
+
+        assert_eq!(v["ledgers"], 100);
+        assert_eq!(v["cost_per_entry_stroops"], 10000);
+        assert_eq!(v["cost_per_entry_xlm"], "0.001");
+
+        // us_new.wasm has 0 UDTs -> 1 instance entry, 0 persistent
+        let classes = &v["classes"];
+        assert_eq!(classes["instance"]["entry_count"], 1);
+        assert_eq!(classes["instance"]["cost_stroops"], 10000);
+        assert_eq!(classes["instance"]["cost_xlm"], "0.001");
+        assert_eq!(classes["persistent"]["entry_count"], 0);
+        assert_eq!(classes["persistent"]["cost_stroops"], 0);
+        assert_eq!(classes["persistent"]["cost_xlm"], "0");
+
+        let total = &v["total"];
+        assert_eq!(total["baseline_entries"], 1);
+        assert_eq!(total["cost_stroops"], 10000);
+        assert_eq!(total["cost_xlm"], "0.001");
     }
 }

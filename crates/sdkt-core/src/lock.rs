@@ -178,7 +178,7 @@ fn find_artifact(base_dir: &Path, contract_path: &str) -> Option<PathBuf> {
     let base = base_dir.join(contract_path);
     let target_dir = base
         .join("target")
-        .join("wasm32-unknown-unknown")
+        .join(crate::build::WASM_BUILD_TARGET)
         .join("release");
     if !target_dir.exists() {
         return None;
@@ -797,7 +797,7 @@ mod tests {
     fn write_temp_wasm(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let target = dir
             .join("target")
-            .join("wasm32-unknown-unknown")
+            .join(crate::build::WASM_BUILD_TARGET)
             .join("release");
         fs::create_dir_all(&target).unwrap();
         let p = target.join(name);
@@ -851,6 +851,7 @@ mod tests {
                 path: "contracts/token".to_string(),
                 deploy_after: vec![],
                 depends_on: vec![],
+                ctor_args: vec![],
             },
         );
         map.insert(
@@ -859,6 +860,7 @@ mod tests {
                 path: "contracts/router".to_string(),
                 deploy_after: vec!["token".to_string()],
                 depends_on: vec![],
+                ctor_args: vec![],
             },
         );
         let config = config_with(map);
@@ -910,6 +912,7 @@ mod tests {
                 path: "contracts/token".to_string(),
                 deploy_after: vec![],
                 depends_on: vec![],
+                ctor_args: vec![],
             },
         );
         let config = config_with(map);
@@ -936,6 +939,7 @@ mod tests {
                 path: "contracts/token".to_string(),
                 deploy_after: vec![],
                 depends_on: vec![],
+                ctor_args: vec![],
             },
         );
         let config = config_with(map);
@@ -977,6 +981,7 @@ mod tests {
                 path: "contracts/token".to_string(),
                 deploy_after: vec![],
                 depends_on: vec![],
+                ctor_args: vec![],
             },
         );
         let config = config_with(map);

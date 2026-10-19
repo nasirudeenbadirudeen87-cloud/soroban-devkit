@@ -16,7 +16,9 @@ curl -fsSL https://raw.githubusercontent.com/SaboLabs/soroban-devkit/main/instal
 The script:
 - detects your OS (`Linux` / `macOS`) and architecture (`x86_64` / `aarch64`),
 - downloads the matching GitHub Release asset
-  (`sdkt-<target>.tar.gz` + `sdkt-<target>.sha256`),
+  (`sdkt-<target>.tar.gz` + `sdkt-<target>.sha256`). The `aarch64` Linux asset
+  ships from v2.7.0; against older tags the script says so
+  and points you at the source build instead of failing with a bare 404,
 - **verifies the checksum before extracting/running anything**,
 - installs the binary and prints `PATH` guidance if needed.
 
@@ -29,15 +31,17 @@ aborts.
 Custom install directory:
 
 ```bash
-SDKT_INSTALL_DIR=/usr/local/bin curl -fsSL \
-  https://raw.githubusercontent.com/SaboLabs/soroban-devkit/main/install.sh | bash
+curl -fsSL \
+  https://raw.githubusercontent.com/SaboLabs/soroban-devkit/main/install.sh \
+  | SDKT_INSTALL_DIR="$HOME/bin" bash
 ```
 
 Pin a specific version:
 
 ```bash
-SDKT_VERSION=v2.5.0 curl -fsSL \
-  https://raw.githubusercontent.com/SaboLabs/soroban-devkit/main/install.sh | bash
+curl -fsSL \
+  https://raw.githubusercontent.com/SaboLabs/soroban-devkit/main/install.sh \
+  | SDKT_VERSION=v2.7.0 bash
 ```
 
 ## Option A — Manual GitHub Release download
@@ -48,8 +52,10 @@ SDKT_VERSION=v2.5.0 curl -fsSL \
    | Platform | Asset |
    |----------|-------|
    | Linux (x86_64) | `sdkt-x86_64-unknown-linux-gnu.tar.gz` |
+   | Linux (aarch64) | `sdkt-aarch64-unknown-linux-gnu.tar.gz` |
    | macOS (Intel) | `sdkt-x86_64-apple-darwin.tar.gz` |
    | macOS (Apple Silicon) | `sdkt-aarch64-apple-darwin.tar.gz` |
+   | Windows (x86_64) | `sdkt-x86_64-pc-windows-msvc.zip` |
 
 2. Verify the checksum, then extract and run:
 
@@ -62,9 +68,10 @@ SDKT_VERSION=v2.5.0 curl -fsSL \
 
 ## Windows
 
-Windows x86_64 is tested in CI. **v2.5.0 GitHub Release does not include**
-`sdkt-x86_64-pc-windows-msvc.zip` (linux + macOS tarballs only). Use crates.io
-or source until the next tag, whose `release.yml` builds that zip.
+Windows x86_64 is tested in CI, and **`v2.7.0` ships**
+`sdkt-x86_64-pc-windows-msvc.zip`. (The older v2.5.0 Release carried only the
+Linux + macOS tarballs.) On Windows you can also use crates.io or a source
+build.
 
 ### Option A — Prebuilt binary (next tagged release)
 
@@ -119,9 +126,11 @@ cargo build --bin sdkt
 
 ## Option C — From crates.io (published)
 
-All workspace crates are published to crates.io (current release `v2.5.0`):
-`sdkt-cli`, `sdkt-core`, `sdkt-xdr`, `sdkt-wasm`, `sdkt-rpc`, `sdkt-storage`,
-`sdkt-audit`, and `sdkt-audit-example-rule`. Install the CLI binary directly:
+crates.io currently publishes **`v2.7.0`** — matching the repository's
+current release. The 8 published crates are `sdkt-cli`, `sdkt-core`,
+`sdkt-xdr`, `sdkt-wasm`, `sdkt-rpc`, `sdkt-storage`, `sdkt-audit`, and
+`sdkt-audit-example-rule`. `sdkt-agent` remains a repo-only prototype and is
+not published. Install the CLI binary directly:
 
 ```bash
 cargo install sdkt-cli
@@ -131,7 +140,7 @@ sdkt --version
 To pin a released version:
 
 ```bash
-cargo install sdkt-cli --version 2.5.0
+cargo install sdkt-cli --version 2.7.0   # latest published on crates.io
 ```
 
 The `sdkt` binary name is reserved by `sdkt-cli` (the published package name is

@@ -7,7 +7,7 @@ use crate::error::StorageError;
 use directories::ProjectDirs;
 use sdkt_wasm::WasmMetadata;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Info about the current state of the WASM cache for a specific network.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,11 +25,22 @@ pub struct WasmCache {
 
 impl WasmCache {
     /// Creates a new `WasmCache` instance.
-    /// Uses the standard OS cache directory:
+    ///
+    /// The directory location can be overridden via the `SDKT_CACHE_DIR` environment
+    /// variable (checked first). If unset or empty, uses the standard OS cache directory:
     /// - Linux: `~/.cache/soroban-devkit/`
     /// - macOS: `~/Library/Caches/org.SaboLabs.soroban-devkit/`
     /// - Windows: `%LOCALAPPDATA%\SaboLabs\soroban-devkit\cache\`
     pub fn new() -> Result<Self, StorageError> {
+        if let Ok(dir) = std::env::var("SDKT_CACHE_DIR") {
+            let trimmed = dir.trim();
+            if !trimmed.is_empty() {
+                return Ok(Self {
+                    base_dir: PathBuf::from(trimmed),
+                });
+            }
+        }
+
         let proj_dirs =
             ProjectDirs::from("org", "SaboLabs", "soroban-devkit").ok_or_else(|| {
                 StorageError::Io(std::io::Error::new(
@@ -42,6 +53,11 @@ impl WasmCache {
         Ok(Self { base_dir })
     }
 
+    /// Returns the base directory of the cache.
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
     /// Creates a cache instance targeting a specific directory (useful for testing).
     pub fn with_dir<P: AsRef<Path>>(path: P) -> Self {
         Self {
@@ -52,6 +68,7 @@ impl WasmCache {
     /// Returns the directory for a specific network (e.g., `testnet`).
     /// Creates the directory if it doesn't exist.
     fn network_dir(&self, network: &str) -> Result<PathBuf, StorageError> {
+        validate_network_name(network)?;
         let net_dir = self.base_dir.join("wasm").join(network);
         if !net_dir.exists() {
             fs::create_dir_all(&net_dir).map_err(StorageError::Io)?;
@@ -122,10 +139,22 @@ impl WasmCache {
     }
 
     /// Removes a specific WASM entry (both JSON and `.wasm`) from the cache.
+    ///
+    /// A hash that is not cached is an error, not a silent success: callers
+    /// print "Removed" on `Ok`, and reporting success for a no-op reads as a
+    /// completed mutation to scripts and agents. Matches `identity delete` and
+    /// `network remove`, which surface `Not found:` and exit non-zero.
     pub fn remove(&self, network: &str, wasm_hash: &str) -> Result<(), StorageError> {
         let net_dir = self.network_dir(network)?;
         let meta_path = net_dir.join(format!("{}.json", wasm_hash));
         let wasm_path = net_dir.join(format!("{}.wasm", wasm_hash));
+
+        if !meta_path.exists() && !wasm_path.exists() {
+            return Err(StorageError::NotFound(format!(
+                "WASM cache entry '{}' not found in {} cache",
+                wasm_hash, network
+            )));
+        }
 
         if meta_path.exists() {
             fs::remove_file(meta_path).map_err(StorageError::Io)?;
@@ -138,6 +167,10 @@ impl WasmCache {
     }
 
     /// Clears all cached WASM entries for a specific network.
+    ///
+    /// Unlike `remove`, this stays truthful as a no-op success: "cleared" is
+    /// accurate for an empty cache (the post-condition holds), and unlike a
+    /// hash miss it is not evidence that a named target was deleted.
     pub fn clear(&self, network: &str) -> Result<(), StorageError> {
         let net_dir = self.network_dir(network)?;
         if net_dir.exists() {
@@ -153,6 +186,7 @@ impl WasmCache {
     /// working on fresh CI runners (Linux/macOS/Windows) where the cache path
     /// does not yet exist.
     pub fn cache_info(&self, network: &str) -> Result<CacheInfo, StorageError> {
+        validate_network_name(network)?;
         let net_dir = self.base_dir.join("wasm").join(network);
 
         let mut entry_count = 0;
@@ -193,6 +227,26 @@ impl WasmCache {
     }
 }
 
+fn validate_network_name(network: &str) -> Result<(), StorageError> {
+    if network.is_empty()
+        || network == "."
+        || network == ".."
+        || network.contains('/')
+        || network.contains('\\')
+        || !matches!(
+            Path::new(network).components().next(),
+            Some(Component::Normal(_))
+        )
+        || Path::new(network).components().nth(1).is_some()
+    {
+        return Err(StorageError::ConfigError(format!(
+            "invalid network name '{}': must be a non-empty path component",
+            network
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +266,12 @@ mod tests {
             exports: vec![],
             imports: vec![],
             custom_sections: vec![],
+            contract_meta: vec![],
+            function_count: 0,
+            memory: None,
+            table_count: 0,
+            global_count: 0,
+            data_segment_count: 0,
         }
     }
 
@@ -248,6 +308,20 @@ mod tests {
         assert_eq!(info.entry_count, 0);
         assert_eq!(info.total_metadata_size_bytes, 0);
         assert_eq!(info.total_wasm_size_bytes, 0);
+    }
+
+    #[test]
+    fn test_remove_missing_is_not_found_error() {
+        // A no-op removal must not report success: callers print "Removed" on
+        // Ok, and scripts/agents read that as a completed mutation.
+        let (cache, _dir) = get_temp_cache();
+        let err = cache
+            .remove("mainnet", "never_cached")
+            .expect_err("removing an absent entry must fail");
+        assert!(
+            matches!(&err, StorageError::NotFound(m) if m.contains("never_cached")),
+            "expected NotFound, got {err:?}"
+        );
     }
 
     #[test]
@@ -304,6 +378,38 @@ mod tests {
         assert_eq!(info.entry_count, 0);
     }
 
+    #[test]
+    fn rejects_path_traversal_before_filesystem_access() {
+        let (cache, dir) = get_temp_cache();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        assert!(matches!(
+            cache.clear("../outside"),
+            Err(StorageError::ConfigError(_))
+        ));
+        assert!(outside.exists());
+        assert!(matches!(
+            cache.remove("nested/name", "hash"),
+            Err(StorageError::ConfigError(_))
+        ));
+        assert!(matches!(
+            cache.cache_info(""),
+            Err(StorageError::ConfigError(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_drive_relative_network_name() {
+        let (cache, _dir) = get_temp_cache();
+
+        assert!(matches!(
+            cache.clear("C:outside"),
+            Err(StorageError::ConfigError(_))
+        ));
+    }
+
     // ---------------------------------------------------------------------------
     // Windows-specific regression tests
     // ---------------------------------------------------------------------------
@@ -332,5 +438,22 @@ mod tests {
             "Windows cache path should contain the 'soroban-devkit' app name, got: {}",
             cache.base_dir.display()
         );
+    }
+
+    #[test]
+    fn test_new_with_env_var_override() {
+        let tmp = TempDir::new().unwrap();
+        let key = "SDKT_CACHE_DIR";
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, tmp.path());
+
+        let cache = WasmCache::new().expect("WasmCache::new() with SDKT_CACHE_DIR");
+        assert_eq!(cache.base_dir(), tmp.path());
+
+        if let Some(p) = prev {
+            std::env::set_var(key, p);
+        } else {
+            std::env::remove_var(key);
+        }
     }
 }

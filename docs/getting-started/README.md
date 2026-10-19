@@ -26,7 +26,7 @@ bash scripts/smoke_examples.sh
 
 The script verifies, against the actual binary:
 
-1. `sdkt --version` reports `2.5.0`.
+1. `sdkt --version` reports `2.7.0`.
 2. `sdkt wasm inspect crates/sdkt-cli/tests/fixtures/us_old.wasm` shows a
    contract spec with `fn transfer`.
 3. `sdkt audit examples/sample_token/src/lib.rs` reports `AUTH-001` on
@@ -105,9 +105,8 @@ sdkt init my-project --minimal   # scaffolds a project + .sdkt.toml
 sdkt inspect <CONTRACT_ID> --abi contract.wasm
 sdkt storage check <CONTRACT_ID> --abi contract.wasm
 sdkt storage analyze <CONTRACT_ID>
-
-# NOTE: `sdkt storage estimate` is NOT YET IMPLEMENTED (placeholder only —
-# it prints a stub message and does not compute a real storage-cost estimate).
+# Estimate storage rent offline for a WASM contract (per-class breakdown and total)
+sdkt storage estimate contract.wasm
 
 # Read a contract storage entry by its complete LedgerKey (base64 XDR)
 sdkt storage read --contract <CONTRACT_ID> --key-xdr <BASE64_LEDGER_KEY>
@@ -159,6 +158,7 @@ read the network from `.sdkt.toml` or default to testnet RPC.
 
 ```bash
 sdkt events <CONTRACT_ID> --abi contract.wasm
+sdkt events <CONTRACT_ID> --topic transfer   # only events whose first topic is `transfer`
 sdkt account <ADDRESS>
 sdkt fee estimate
 ```
@@ -190,6 +190,21 @@ sdkt network remove testnet
 
 # Machine-readable output for scripting / CI
 sdkt network show testnet --format json
+
+# Diagnose a network before trusting it: passphrase identity, protocol
+# agreement across RPC + Horizon, and the ledger resource limits Horizon
+# actually observed. Read-only; never signs, submits, or deploys.
+sdkt network diagnose --network testnet
+sdkt network diagnose --network testnet --format json
+```
+
+### Verify a deployed contract is the artifact you built
+
+```bash
+# Compare a local WASM's SHA-256 against the deployed contract's executable
+# via a raw ledger probe. Verdicts: MATCH / DRIFT / UNKNOWN / NOT_FOUND.
+# Read-only; never signs, submits, or deploys.
+sdkt deployment-verify --contract <CONTRACT_ID> --wasm target/wasm32v1-none/release/contract.wasm --network testnet
 ```
 
 ### Fund an identity (Testnet only)
@@ -295,8 +310,7 @@ sdkt invoke C... increment --args u32:1 --identity alice --network-profile testn
 # JSON output for scripting
 sdkt invoke C... set_admin --args address:G... --identity alice --format json --network-profile testnet
 
-# Submit without waiting for settlement (prints the hash with status PENDING)
-sdkt invoke C... increment --args u32:1 --identity alice --no-wait --network-profile testnet
+ main
 ```
 
 - `--args` uses the same `TYPE:VALUE` syntax as `call`, but is strict: an
@@ -307,16 +321,14 @@ sdkt invoke C... increment --args u32:1 --identity alice --no-wait --network-pro
   inclusion fee); the footprint and auth entries come from the same simulation.
 - Output shows the transaction hash, final status, fee, and result XDR.
   Exit code is non-zero when the transaction fails or is rejected.
-- By default, `invoke` polls until the transaction settles. Use `--no-wait` to
-  return immediately after successful submission with the transaction hash and
-  `PENDING` status; this mode exits successfully and does not call
-  `getTransaction`.
+ main
 - Relation to `tx build/sign/submit`: `invoke` is the one-command equivalent of
   `tx build` (with a real sequence + simulated fees) → `tx sign` →
-  `tx submit --wait`. Use the `tx` subcommands when you need to inspect or
+  `tx submit --wait`; `invoke --build-only` covers the first two without the
+  `tx` round-trip. Use the `tx` subcommands when you need to inspect or
   modify the envelope between steps; use `invoke` for the common straight path.
 - Limitations (core implementation): single-operation only, no ABI-aware
-  result decoding of the return value, no `--fee` override, no dry-run flag.
+  result decoding of the return value, no `--fee` override.
   A live Testnet smoke test is documented here but NOT exercised in CI.
 
 ## CI gating (copy-paste)
@@ -338,7 +350,7 @@ jobs:
       - uses: SaboLabs/soroban-devkit/.github/actions/sdkt@main
         with:
           command: audit
-          sdkt-version: v2.5.0
+          sdkt-version: v2.7.0
           target: contracts/token/src/lib.rs
           severity-threshold: critical
 ```
@@ -359,7 +371,7 @@ jobs:
       - uses: SaboLabs/soroban-devkit/.github/actions/sdkt@main
         with:
           command: upgrade-safety
-          sdkt-version: v2.5.0
+          sdkt-version: v2.7.0
           old-wasm: builds/current.wasm
           new-wasm: builds/candidate.wasm
 ```

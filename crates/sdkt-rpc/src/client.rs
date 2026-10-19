@@ -7,6 +7,9 @@ use sdkt_core::NetworkConfig;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Maximum number of keys accepted by one Soroban `getLedgerEntries` request.
+pub const MAX_LEDGER_KEYS: usize = 200;
+
 /// Soroban RPC HTTP client.
 ///
 /// Holds the RPC endpoint URL and a reusable HTTP client.
@@ -66,7 +69,18 @@ impl SorobanRpcClient {
         &self.endpoint
     }
 
+    /// Return a reference to the internal HTTP client.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
     /// Helper for making JSON-RPC calls with basic timeout retry logic.
+    ///
+    /// Retryable failures — transport timeouts/connect errors and retryable
+    /// HTTP statuses (`429`, `5xx`) — are retried within the same two-attempt
+    /// budget. A non-success status is surfaced as [`RpcError::HttpStatus`]
+    /// (or, when its body fails to parse, an error naming the status) instead
+    /// of being misread as a body-decoding failure.
     pub async fn request<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -80,10 +94,10 @@ impl SorobanRpcClient {
         });
 
         let mut attempt = 0;
-        let mut last_err = None;
+        let mut last_err: Option<RpcError> = None;
 
         while attempt < 2 {
-            match self
+            let res = match self
                 .http_client
                 .post(&self.endpoint)
                 .json(&payload)
@@ -91,33 +105,59 @@ impl SorobanRpcClient {
                 .send()
                 .await
             {
-                Ok(res) => {
-                    let rpc_res: JsonRpcResponse<T> = match res.json().await {
-                        Ok(json) => json,
-                        Err(e) => return Err(RpcError::Reqwest(e)),
-                    };
-
-                    if let Some(error) = rpc_res.error {
-                        return Err(RpcError::Rpc(error.message));
-                    }
-
-                    return rpc_res.result.ok_or_else(|| {
-                        RpcError::Rpc("Missing result in JSON-RPC response".to_string())
-                    });
-                }
+                Ok(res) => res,
                 Err(e) => {
                     if e.is_timeout() || e.is_connect() {
-                        last_err = Some(e);
+                        last_err = Some(RpcError::Reqwest(e));
                         attempt += 1;
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
                     }
                     return Err(RpcError::Reqwest(e));
                 }
+            };
+
+            if !res.status().is_success() {
+                let status = res.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                    // Retryable at the HTTP level: same budget, same backoff
+                    // as the transport branch.
+                    last_err = Some(RpcError::HttpStatus {
+                        status: status.as_u16(),
+                    });
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                return Err(RpcError::HttpStatus {
+                    status: status.as_u16(),
+                });
             }
+
+            let rpc_res: JsonRpcResponse<T> = match res.json().await {
+                Ok(json) => json,
+                Err(e) => return Err(RpcError::Reqwest(e)),
+            };
+
+            if let Some(error) = rpc_res.error {
+                // JSON-RPC 2.0 requires `code`; a node that omits it
+                // still gets its message surfaced as before.
+                return Err(match error.code {
+                    Some(code) => RpcError::JsonRpc {
+                        code,
+                        message: error.message,
+                        data: error.data,
+                    },
+                    None => RpcError::Rpc(error.message),
+                });
+            }
+
+            return rpc_res
+                .result
+                .ok_or_else(|| RpcError::Rpc("Missing result in JSON-RPC response".to_string()));
         }
 
-        Err(RpcError::Reqwest(last_err.unwrap()))
+        Err(last_err.unwrap_or_else(|| RpcError::Rpc("request failed".to_string())))
     }
 
     /// Check the health of the Soroban RPC node.
@@ -130,12 +170,27 @@ impl SorobanRpcClient {
         self.request("getLatestLedger", ()).await
     }
 
-    /// Get contract storage entries.
+    /// Get network identity and protocol information from the RPC endpoint.
+    pub async fn get_network(&self) -> Result<NetworkInfo, RpcError> {
+        self.request("getNetwork", ()).await
+    }
+
+    /// Get contract storage entries in a single RPC request.
+    ///
+    /// More than [`MAX_LEDGER_KEYS`] keys returns [`RpcError::TooManyLedgerKeys`]
+    /// before any HTTP request. Use [`crate::storage::fetch_ledger_entries`] for
+    /// larger key sets, which are fetched in sequential batches.
     pub async fn get_contract_storage(
         &self,
         _contract_id: &str,
         keys: &[String],
     ) -> Result<StorageResponse, RpcError> {
+        if keys.len() > MAX_LEDGER_KEYS {
+            return Err(RpcError::TooManyLedgerKeys {
+                count: keys.len(),
+                max: MAX_LEDGER_KEYS,
+            });
+        }
         self.request("getLedgerEntries", serde_json::json!({ "keys": keys }))
             .await
     }
@@ -223,7 +278,11 @@ struct JsonRpcResponse<T> {
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcError {
+    #[serde(default)]
+    code: Option<i64>,
     message: String,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
 }
 
 /// Health check response from the node.
@@ -243,6 +302,24 @@ pub struct LedgerInfo {
     pub sequence: u32,
 }
 
+/// Network identity and protocol details reported by `getNetwork`.
+///
+/// `latest_ledger` is optional because the SDF endpoints (testnet, futurenet,
+/// mainnet) answer `getNetwork` with only `passphrase`, `protocolVersion` and
+/// `friendbotUrl`; a required field there made every `getNetwork` decode fail
+/// on those endpoints and the error was swallowed by callers that treated the
+/// probe as best-effort.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkInfo {
+    #[serde(default)]
+    pub friendbot_url: Option<String>,
+    pub passphrase: String,
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub latest_ledger: Option<u32>,
+}
+
 /// Storage response payload.
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct StorageResponse {
@@ -251,13 +328,19 @@ pub struct StorageResponse {
     pub latest_ledger: u32,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct LedgerEntryResult {
     pub key: String,
     pub xdr: String,
     pub last_modified_ledger_seq: u32,
     pub live_until_ledger_seq: Option<u32>,
+    /// Base64 XDR encoded `ScVal` extracted from the entry's `ContractData`
+    /// when the entry is a contract-data entry. `None` for `ContractCode`
+    /// entries, entries whose XDR fails to parse, or when the field is absent
+    /// from the RPC response. Additive: existing consumers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 #[cfg(test)]
@@ -281,6 +364,39 @@ mod tests {
         };
         let c = SorobanRpcClient::from_config(&cfg);
         assert_eq!(c.endpoint(), "https://custom.example.com");
+    }
+
+    #[test]
+    fn network_info_deserializes_rpc_camel_case_fields() {
+        let info: NetworkInfo = serde_json::from_value(serde_json::json!({
+            "friendbotUrl": "https://friendbot.example",
+            "passphrase": "Test Network",
+            "protocolVersion": 22,
+            "latestLedger": 1234
+        }))
+        .unwrap();
+
+        assert_eq!(
+            info.friendbot_url.as_deref(),
+            Some("https://friendbot.example")
+        );
+        assert_eq!(info.passphrase, "Test Network");
+        assert_eq!(info.protocol_version, 22);
+        assert_eq!(info.latest_ledger, Some(1234));
+    }
+
+    /// The live SDF endpoints answer `getNetwork` without `latestLedger`; a
+    /// required field there made the decode fail on every real endpoint.
+    #[test]
+    fn network_info_deserializes_without_latest_ledger() {
+        let info: NetworkInfo = serde_json::from_value(serde_json::json!({
+            "friendbotUrl": "https://friendbot.stellar.org/",
+            "passphrase": "Test SDF Network ; September 2015",
+            "protocolVersion": 29
+        }))
+        .unwrap();
+        assert_eq!(info.protocol_version, 29);
+        assert_eq!(info.latest_ledger, None);
     }
 
     #[test]
@@ -538,5 +654,236 @@ mod tests {
         assert!(err.to_string().contains("400"));
 
         server.await.unwrap();
+    }
+
+    /// Serve one canned JSON-RPC body on a local socket and return its URL.
+    async fn serve_once(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _n = sock.read(&mut buf).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    /// Serve a fixed HTTP status + body to *every* request, counting how many
+    /// requests arrived. Returns the URL, the request counter, and the handle.
+    async fn serve_status_always(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_srv = Arc::clone(&count);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 8192];
+                let _n = sock.read(&mut buf).await.unwrap_or(0);
+                count_srv.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), count, server)
+    }
+
+    /// A non-JSON `HTTP 503` body must yield an error naming the status, not a
+    /// body-decoding error — that was the core ambiguity of the issue.
+    #[tokio::test]
+    async fn request_non_json_503_names_status() {
+        let (url, count, server) =
+            serve_status_always("503 Service Unavailable", "upstream unavailable").await;
+
+        let err = SorobanRpcClient::new(&url)
+            .request::<HealthCheck>("getHealth", ())
+            .await
+            .unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("503"), "error must name the status: {text}");
+        assert!(
+            matches!(err, RpcError::HttpStatus { status: 503 }),
+            "expected HttpStatus{{503}}, got {err:?}"
+        );
+        // 503 is retryable: the budget is 2 attempts.
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// A `HTTP 503` carrying a valid JSON-RPC error body must be retried and,
+    /// once the budget is exhausted, name the status — the retry branch must
+    /// not be skipped just because the body parsed.
+    #[tokio::test]
+    async fn request_jsonrpc_503_is_retried_then_names_status() {
+        let (url, count, server) = serve_status_always(
+            "503 Service Unavailable",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"service unavailable"}}"#,
+        )
+        .await;
+
+        let err = SorobanRpcClient::new(&url)
+            .request::<HealthCheck>("getHealth", ())
+            .await
+            .unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("503"), "{text}");
+        assert!(
+            matches!(err, RpcError::HttpStatus { status: 503 }),
+            "expected HttpStatus{{503}}, got {err:?}"
+        );
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "503 must be retried"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_429_is_retried() {
+        let (url, count, server) = serve_status_always("429 Too Many Requests", "slow down").await;
+
+        let err = SorobanRpcClient::new(&url)
+            .request::<HealthCheck>("getHealth", ())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RpcError::HttpStatus { status: 429 }));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// A non-retryable 4xx must fail immediately with the status named, and
+    /// must NOT consume a retry attempt.
+    #[tokio::test]
+    async fn request_400_is_terminal_and_names_status() {
+        let (url, count, server) = serve_status_always("400 Bad Request", "nope").await;
+
+        let err = SorobanRpcClient::new(&url)
+            .request::<HealthCheck>("getHealth", ())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, RpcError::HttpStatus { status: 400 }));
+        assert!(err.to_string().contains("400"));
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "400 must not be retried"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_preserves_jsonrpc_error_code_without_data() {
+        let (url, server) = serve_once(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unexpected hash length (2)"}}"#,
+        )
+        .await;
+
+        let err = SorobanRpcClient::new(&url)
+            .request::<HealthCheck>("getTransaction", ())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Some(-32602));
+        assert_eq!(err.data(), None);
+        match &err {
+            RpcError::JsonRpc {
+                code,
+                message,
+                data,
+            } => {
+                assert_eq!(*code, -32602);
+                assert_eq!(message, "unexpected hash length (2)");
+                assert!(data.is_none());
+            }
+            other => panic!("expected RpcError::JsonRpc, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "RPC error: unexpected hash length (2) (code -32602)"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_preserves_jsonrpc_error_code_and_data() {
+        let (url, server) = serve_once(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"startLedger must be within the ledger range: 5033608 - 5154567","data":{"oldest":5033608,"latest":5154567}}}"#,
+        )
+        .await;
+
+        let err = SorobanRpcClient::new(&url)
+            .request::<HealthCheck>("getEvents", ())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), Some(-32600));
+        assert_eq!(
+            err.data(),
+            Some(&serde_json::json!({"oldest": 5033608, "latest": 5154567}))
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("startLedger must be within the ledger range: 5033608 - 5154567"),
+            "{text}"
+        );
+        assert!(text.contains("-32600"), "{text}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_without_jsonrpc_error_code_keeps_message() {
+        let (url, server) =
+            serve_once(r#"{"jsonrpc":"2.0","id":1,"error":{"message":"no code here"}}"#).await;
+
+        let err = SorobanRpcClient::new(&url)
+            .request::<HealthCheck>("getHealth", ())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), None);
+        assert!(matches!(&err, RpcError::Rpc(msg) if msg == "no code here"));
+        assert_eq!(err.to_string(), "RPC error: no code here");
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn non_jsonrpc_errors_have_no_code() {
+        let err = RpcError::Rpc("local validation".into());
+        assert_eq!(err.code(), None);
+        assert_eq!(err.data(), None);
+        assert_eq!(RpcError::ContractNotFound.code(), None);
     }
 }

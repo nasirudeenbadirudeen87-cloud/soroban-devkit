@@ -1,9 +1,9 @@
 # Compatibility Matrix — Real-World Soroban Projects
 
 Validated: 2026-08-06 against sdkt 2.1.1 (historical baseline — see note below).
-Current workspace version: **2.5.0** (`sdkt --version` → 2.5.0). The results
+Current workspace version: **2.7.0** (`sdkt --version` → 2.7.0). The results
 below were captured on the 2.1.1 build listed in the environment header and
-have not been re-run on 2.5.0.
+have not been re-run since.
 Toolchain: rustc 1.97.1, target `wasm32v1-none`
 
 ## Purpose
@@ -96,7 +96,10 @@ recommended follow-up (see Known Limitations).
    a persistent testnet contract to close the gap.
 2. **Build target coupling.** Current `soroban-sdk` (≥ 22) requires
    `wasm32v1-none` (not `wasm32-unknown-unknown`) on rustc ≥ 1.82. DevKit's
-   `init` scaffold uses `soroban-sdk = "21.0.0"` which still builds on the legacy target;
+   `init` scaffold pins `soroban-sdk = "=27.0.6"` (#111: every 21.x release now resolves an
+   `ed25519-dalek` that breaks `cargo test`), so generated projects need Rust 1.91+ and build with
+   `cargo build --target wasm32v1-none --release`; `sdkt build` now uses that
+   target for compilation and artifact resolution.
 3. **`audit` is heuristic, not a full borrow-checker.** MOVE-001 flags locals
    passed as call arguments multiple times (a possible move-after-use). On
    `atomic_swap` and `timelock` it surfaces 2–5 warnings that are false

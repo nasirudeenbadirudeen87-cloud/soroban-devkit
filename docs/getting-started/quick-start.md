@@ -2,9 +2,11 @@
 
 This guide takes a developer who has **never used `sdkt`** from zero to a working inspection, audit, and upgrade-safety comparison in under five minutes. Every command is copy-pasteable and runs **offline** (no RPC, no account, no network) unless stated otherwise.
 
-If you only want to inspect a WASM, skip install: [Web Playground](https://sabolabs.github.io/soroban-devkit/playground/).
+If you only want to inspect a WASM, skip install: [Web Playground](https://soroban-devkit.xyz/playground/).
 
 If you have not installed `sdkt` yet, follow [README § Quick Start](https://github.com/SaboLabs/soroban-devkit#quick-start) first. This document assumes `sdkt` is on your `PATH` and reports a version when you run `sdkt --version`.
+
+> **Want the on-chain path next?** After this offline walkthrough, follow the [Testnet walkthrough](testnet-walkthrough.md) (identity → fund → deploy → invoke → events).
 
 ***
 
@@ -19,10 +21,11 @@ Choose **one** of the following.
     | Platform              | Asset                                  |
     | --------------------- | -------------------------------------- |
     | Linux (x86\_64)       | `sdkt-x86_64-unknown-linux-gnu.tar.gz` |
+    | Linux (aarch64)       | `sdkt-aarch64-unknown-linux-gnu.tar.gz` |
     | macOS (Intel)         | `sdkt-x86_64-apple-darwin.tar.gz`      |
     | macOS (Apple Silicon) | `sdkt-aarch64-apple-darwin.tar.gz`     |
 
-    Windows: `cargo install sdkt-cli` (v2.5.0 has no Windows GitHub Release zip).
+    Windows: `sdkt-x86_64-pc-windows-msvc.zip` (v2.6.0+) or `cargo install sdkt-cli` (crates.io is at v2.7.0).
 
 **A2. crates.io (Rust 1.88.0+):**
 
@@ -49,6 +52,12 @@ cd soroban-devkit
 cargo install --path crates/sdkt-cli
 ```
 
+> **Version note:** the GitHub Release carries the current repository release
+> (v2.7.0). crates.io also publishes **v2.7.0**, so `cargo install sdkt-cli`
+> installs v2.7.0. `sdkt-agent` remains a repo-only prototype and is not on
+> crates.io. For the Windows zip use the release binary or build from source
+> (option B).
+
 ***
 
 ## Step 2 — Verify installation
@@ -60,7 +69,7 @@ sdkt --version
 Expected output (version may be newer):
 
 ```
-sdkt 2.5.0
+sdkt 2.7.0
 ```
 
 Then confirm the CLI is responsive:
@@ -127,8 +136,15 @@ pub struct Token;
 
 #[contractimpl]
 impl Token {
-    pub fn transfer(_from: Address, _to: Address, _amount: u64) {
-        // NOTE: intentionally missing require_auth() — sdkt audit will flag this
+    // Guarded entrypoint — the analyzer is satisfied by require_auth().
+    pub fn transfer(from: Address, to: Address, amount: u64) {
+        from.require_auth();
+        let _ = (to, amount);
+    }
+
+    // Privileged-shaped name with no auth guard — this is what AUTH-001 flags.
+    pub fn admin_action(admin: Address) {
+        let _ = admin;
     }
 }
 EOF
@@ -136,14 +152,31 @@ EOF
 sdkt audit /tmp/example_contract.rs
 ```
 
+```
+Static Analysis Report: /tmp/example_contract.rs
+Severity: 1 critical, 0 warning, 0 info (1 total)
+
+  [critical] AUTH-001  [Token::admin_action]: Function `Token::admin_action` looks privileged but does not call require_auth()
+```
+
 Interpreting the output:
 
+* The `AUTH-001` rule flags a function whose **name looks privileged** (`admin_action`) and which never calls `require_auth()`. The guarded `transfer` next to it is not flagged — that is the difference the rule detects. (This is the same rule and shape as the repository's own `examples/sample_token/src/lib.rs` fixture.)
 * `Severity: 0 critical, 0 warning, 0 info (0 total)` with `No issues found.` means the analyzer found nothing to flag.
 * `critical` findings (e.g. `AUTH-001/002/003/004` — missing auth checks) should block a deploy.
 * `warning` findings (e.g. `MOVE-001` — a possible move-after-use of a local) are heuristic and worth a look but are not necessarily bugs.
 * JSON mode (`--format json`) emits the same result as structured data for CI.
 
-Audit runs entirely offline and is safe to gate every pull request on. See [docs/examples.md](./) for the audit-on-PR recipe.
+> **Exit code:** `sdkt audit` exits `0` on findings by default. Use
+> `--fail-on critical` (or `warning` / `info`) to exit `1` when findings at or
+> above that threshold exist. CI gates can also use the
+> [reusable Action](../compatibility/ci-cd.md) (its `severity-threshold` input
+> fails the build on `critical`) or parse `--format json` and check
+> `summary.critical`.
+
+Audit runs entirely offline and is safe to gate pull requests on — via
+`--fail-on`, through the Action, or with a `summary.critical` check (see the note
+above). See [examples.md](examples.md) for the audit-on-PR recipe.
 
 ***
 
@@ -189,7 +222,7 @@ This tells you the upgrade changes `mint()`'s signature and drops the `Transfer`
 
 ***
 
-## Step 5 — Sign a transaction (offline)
+## Step 6 — Sign a transaction (offline)
 
 `sdkt` can sign a built transaction envelope with a local ED25519 identity, **without any network or secret exposure**. First create an identity, then build and sign an envelope.
 
@@ -206,8 +239,9 @@ sdkt tx build \
   --function hello \
   --output unsigned.xdr
 
-# Validate it offline
+# Validate it offline, then review what you are about to sign
 sdkt tx validate --envelope unsigned.xdr
+sdkt tx decode unsigned.xdr
 
 # Sign with the local identity (offline; --network selects the signature hash)
 sdkt tx sign --input unsigned.xdr --output signed.xdr --identity alice --network testnet
@@ -217,12 +251,13 @@ The signed envelope in `signed.xdr` is ready to broadcast with `sdkt tx submit -
 
 ***
 
-## Step 6 — Where to go next
+## Step 7 — Where to go next
 
 You now know the three core offline workflows. Continue with:
 
-* [**Web Playground**](https://sabolabs.github.io/soroban-devkit/playground/) — inspect your own `.wasm` in the browser (no install).
-* [**docs/examples.md**](./) — copy-paste recipes for every subcommand (decode, storage, tx, deploy) and CI gating patterns.
+* [**Testnet walkthrough**](testnet-walkthrough.md) — **on-chain loop**: identity → Friendbot fund → network profile → build → deploy → invoke → call → events / storage.
+* [**Web Playground**](https://soroban-devkit.xyz/playground/) — inspect your own `.wasm` in the browser (no install).
+* [**examples.md**](examples.md) — copy-paste recipes for every subcommand (decode, storage, tx, deploy) and CI gating patterns.
 * [**docs/compatibility.md**](../compatibility/compatibility.md) — which real-world Soroban contracts `sdkt` is validated against, and the compatibility matrix.
 * [**docs/ci-cd.md**](../compatibility/ci-cd.md) — wire `sdkt audit` and `sdkt diff --upgrade-safety` into GitHub Actions to block bad PRs and unsafe releases.
 

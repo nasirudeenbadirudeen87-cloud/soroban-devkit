@@ -22,8 +22,19 @@ impl std::fmt::Display for Severity {
             Severity::Warning => "warning",
             Severity::Info => "info",
         };
-        f.write_str(s)
+        f.pad(s)
     }
+}
+
+/// Metadata describing an available audit rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleInfo {
+    /// Stable rule identifier, e.g. `AUTH-001`.
+    pub id: String,
+    /// Severity emitted by this rule.
+    pub severity: Severity,
+    /// Human-readable description of what the rule checks.
+    pub description: String,
 }
 
 /// A single audit finding produced by a rule.
@@ -33,6 +44,9 @@ pub struct Finding {
     pub rule_id: String,
     pub severity: Severity,
     pub message: String,
+    /// Originating source file for multi-file audits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
     /// Optional human-readable location (function name, or `fn:binding`).
     pub location: Option<String>,
 }

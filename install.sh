@@ -11,6 +11,12 @@
 # SDKT_INSTALL_DIR=/usr/local/bin ./install.sh # custom destination
 # bash install.sh --selftest # offline regression test (no network)
 #
+# Environment variables (both optional):
+#   SDKT_VERSION       Release tag to install, exactly as published (e.g. v2.7.0).
+#                      Default: the latest stable release.
+#   SDKT_INSTALL_DIR   Directory to install sdkt into; created if missing.
+#                      Default: $HOME/.local/bin
+#
 # Security:
 # - set -euo pipefail (strict mode)
 # - the downloaded binary is NEVER executed before its checksum is verified
@@ -152,7 +158,11 @@ if [[ -n "${SDKT_VERSION:-}" ]]; then
   info "using pinned version: $VERSION"
 else
   info "resolving latest stable release..."
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+  # Read the whole response before extracting the tag: piping curl into
+  # `grep -m1` closes the pipe early, and under `set -o pipefail` curl's
+  # SIGPIPE (exit 23) would abort the install on a perfectly good response.
+  RELEASE_JSON="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")"
+  VERSION="$(printf '%s\n' "$RELEASE_JSON" \
     | grep -m1 '"tag_name"' \
     | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
   [[ -n "$VERSION" ]] || err "could not determine the latest release tag from GitHub."
@@ -168,7 +178,22 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 info "downloading $TARBALL ..."
-curl -fsSL "$BASE/$TARBALL" -o "$TMP/$TARBALL" || err "failed to download $TARBALL"
+# Distinguish "this release has no asset for your platform" from a transport
+# failure. Older tags predate a platform's release asset, and a bare curl 404
+# reads as a broken installer rather than a missing (but supported) target.
+if ! curl -fsSL "$BASE/$TARBALL" -o "$TMP/$TARBALL"; then
+  if curl -fsSL -o /dev/null \
+    "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}" 2>/dev/null \
+    && ! curl -fsSL -o /dev/null -I "$BASE/$TARBALL" 2>/dev/null; then
+    err "release ${VERSION} has no ${TARBALL} asset for this platform.
+       Build from source instead:
+         git clone https://github.com/${REPO}
+         cd soroban-devkit && cargo install --path crates/sdkt-cli
+       Or install an older/newer release that ships this target:
+         SDKT_VERSION=<tag> bash install.sh"
+  fi
+  err "failed to download $TARBALL"
+fi
 
 # Prefer the standalone release checksum asset; fall back to the embedded
 # sdkt.sha256 inside the tarball when the standalone asset is absent (e.g.

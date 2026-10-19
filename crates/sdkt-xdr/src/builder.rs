@@ -13,10 +13,10 @@ use stellar_xdr::{
     ContractIdPreimageFromAddress, CreateContractArgs, CreateContractArgsV2, ExtendFootprintTtlOp,
     ExtensionPoint, Hash, HashIdPreimage, HashIdPreimageContractId, HostFunction,
     InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey, Memo, MuxedAccount,
-    Operation, OperationBody, Preconditions, PublicKey, ReadXdr, ScAddress, ScSymbol, ScVal,
-    SequenceNumber, SorobanAuthorizationEntry, SorobanResources, SorobanTransactionData,
-    SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
-    TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    Operation, OperationBody, Preconditions, PublicKey, ReadXdr, RestoreFootprintOp, ScAddress,
+    ScSymbol, ScVal, SequenceNumber, SorobanAuthorizationEntry, SorobanResources,
+    SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
+    TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
 /// Parameters for building a basic contract invocation transaction.
@@ -34,6 +34,29 @@ pub struct InvokeTransactionParams {
     pub function: String,
     /// Optional arguments (as pre-encoded ScVal base64 strings)
     pub args: Vec<String>,
+    /// Optional transaction memo. `None` builds `Memo::None` (unchanged default).
+    pub memo: Option<Memo>,
+}
+
+/// Build a `Memo::Text`, enforcing the protocol's 28-byte limit.
+///
+/// Mirrors the validation the core transaction builder performs, so an
+/// over-long memo is rejected here with an actionable message instead of being
+/// silently truncated.
+pub fn memo_text(text: &str) -> Result<Memo, DecodeError> {
+    let bytes = text.as_bytes();
+    let vec_m = bytes.try_into().map_err(|_| {
+        DecodeError::Extraction(format!(
+            "memo text must be at most 28 bytes (got {})",
+            bytes.len()
+        ))
+    })?;
+    Ok(Memo::Text(vec_m))
+}
+
+/// Build a `Memo::Id`.
+pub fn memo_id(id: u64) -> Memo {
+    Memo::Id(id)
 }
 
 /// Decode a G... StrKey into an `AccountId`.
@@ -109,7 +132,7 @@ pub fn build_invoke_transaction(params: &InvokeTransactionParams) -> Result<Stri
         fee: params.fee,
         seq_num: SequenceNumber(params.sequence),
         cond: Preconditions::None,
-        memo: Memo::None,
+        memo: params.memo.clone().unwrap_or(Memo::None),
         operations: VecM::try_from(vec![op]).unwrap(),
         ext: TransactionExt::V0,
     };
@@ -181,7 +204,7 @@ pub fn build_invoke_transaction_with_data(
         fee: params.fee,
         seq_num: SequenceNumber(params.sequence),
         cond: Preconditions::None,
-        memo: Memo::None,
+        memo: params.memo.clone().unwrap_or(Memo::None),
         operations: VecM::try_from(vec![op]).unwrap(),
         ext: TransactionExt::V1(soroban_data),
     };
@@ -937,6 +960,61 @@ pub fn build_extend_footprint_tx_with_data(
     build_extend_envelope(params, soroban_data)
 }
 
+/// Parameters for building a `RestoreFootprint` transaction.
+#[derive(Debug, Clone)]
+pub struct RestoreFootprintParams {
+    /// Source account public key (G...)
+    pub source_account: String,
+    /// Next sequence number for the source account
+    pub sequence: i64,
+    /// Transaction fee in stroops (must be >= min_resource_fee from preamble)
+    pub fee: u32,
+    /// `SorobanTransactionData` from the restore preamble (authoritative footprint)
+    pub soroban_data: SorobanTransactionData,
+}
+
+/// Builds a `TransactionEnvelope` for `RestoreFootprint`.
+///
+/// Uses the `SorobanTransactionData` from the restore preamble, which contains
+/// the authoritative footprint and resource bounds needed to restore archived entries.
+///
+/// Rejects an empty footprint (nothing to restore) and a fee below the
+/// preamble's `resource_fee`, which the network would refuse.
+pub fn build_restore_footprint_tx(params: &RestoreFootprintParams) -> Result<String, DecodeError> {
+    let footprint = &params.soroban_data.resources.footprint;
+    if footprint.read_only.is_empty() && footprint.read_write.is_empty() {
+        return Err(DecodeError::Extraction(
+            "restore footprint is empty: no archived entries to restore".into(),
+        ));
+    }
+    if i64::from(params.fee) < params.soroban_data.resource_fee {
+        return Err(DecodeError::Extraction(format!(
+            "restore fee {} is below the preamble resource fee {}",
+            params.fee, params.soroban_data.resource_fee
+        )));
+    }
+    let source_account = decode_account_id(&params.source_account)?;
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::RestoreFootprint(RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        }),
+    };
+    let tx = Transaction {
+        source_account: muxed_from_account(source_account),
+        fee: params.fee,
+        seq_num: SequenceNumber(params.sequence),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: VecM::try_from(vec![op]).unwrap(),
+        ext: TransactionExt::V1(params.soroban_data.clone()),
+    };
+    encode_envelope(TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    }))
+}
+
 /// Derives the contract ID from network ID, deployer address, and salt.
 ///
 /// Uses Stellar's official formula:
@@ -1077,6 +1155,7 @@ mod tests {
             contract_id: TEST_CONTRACT.to_string(),
             function: "hello".to_string(),
             args: vec![],
+            memo: None,
         };
 
         let envelope = build_invoke_transaction(&params).unwrap();
@@ -1110,10 +1189,85 @@ mod tests {
             contract_id: TEST_CONTRACT.to_string(),
             function: "add".to_string(),
             args: vec![arg_b64.to_string()],
+            memo: None,
         };
 
         let envelope = build_invoke_transaction(&params).unwrap();
         assert!(!envelope.is_empty());
+    }
+
+    fn envelope_memo(envelope_b64: &str) -> Memo {
+        let raw = STANDARD.decode(envelope_b64).unwrap();
+        let mut cursor = std::io::Cursor::new(&raw);
+        let mut l = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+        match TransactionEnvelope::read_xdr(&mut l).unwrap() {
+            TransactionEnvelope::Tx(v1) => v1.tx.memo,
+            _ => panic!("Expected V1 envelope"),
+        }
+    }
+
+    #[test]
+    fn test_build_invoke_transaction_with_memo_text() {
+        let params = InvokeTransactionParams {
+            source_account: TEST_SOURCE.to_string(),
+            sequence: 7,
+            fee: 100,
+            contract_id: TEST_CONTRACT.to_string(),
+            function: "transfer".to_string(),
+            args: vec![],
+            memo: Some(memo_text("deposit-123").unwrap()),
+        };
+
+        let envelope = build_invoke_transaction(&params).unwrap();
+        let memo = envelope_memo(&envelope);
+
+        assert!(matches!(memo, Memo::Text(_)));
+        assert_eq!(memo, memo_text("deposit-123").unwrap());
+    }
+
+    #[test]
+    fn test_build_invoke_transaction_with_memo_id() {
+        let params = InvokeTransactionParams {
+            source_account: TEST_SOURCE.to_string(),
+            sequence: 7,
+            fee: 100,
+            contract_id: TEST_CONTRACT.to_string(),
+            function: "transfer".to_string(),
+            args: vec![],
+            memo: Some(memo_id(42)),
+        };
+
+        let envelope = build_invoke_transaction(&params).unwrap();
+        let memo = envelope_memo(&envelope);
+
+        assert!(matches!(memo, Memo::Id(_)));
+        assert_eq!(memo, Memo::Id(42));
+    }
+
+    #[test]
+    fn test_build_invoke_transaction_without_memo_is_none() {
+        let params = InvokeTransactionParams {
+            source_account: TEST_SOURCE.to_string(),
+            sequence: 7,
+            fee: 100,
+            contract_id: TEST_CONTRACT.to_string(),
+            function: "transfer".to_string(),
+            args: vec![],
+            memo: None,
+        };
+
+        let envelope = build_invoke_transaction(&params).unwrap();
+        assert_eq!(envelope_memo(&envelope), Memo::None);
+    }
+
+    #[test]
+    fn test_memo_text_accepts_max_length_and_rejects_over_long() {
+        let max = "x".repeat(28);
+        assert!(memo_text(&max).is_ok());
+
+        let too_long = "x".repeat(29);
+        let err = memo_text(&too_long).unwrap_err();
+        assert!(matches!(err, DecodeError::Extraction(msg) if msg.contains("28 bytes")));
     }
 
     #[test]
@@ -1861,5 +2015,156 @@ mod extend_tests {
             },
             _ => panic!("Expected V1 envelope"),
         }
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::builder::{build_restore_footprint_tx, RestoreFootprintParams};
+    use stellar_xdr::{
+        ContractDataDurability, Hash, LedgerFootprint, LedgerKey, LedgerKeyContractData, Limited,
+        Limits, OperationBody, ScAddress, ScVal, SorobanResources, SorobanTransactionData,
+        SorobanTransactionDataExt, TransactionEnvelope, TransactionExt, VecM,
+    };
+
+    fn create_test_soroban_data() -> SorobanTransactionData {
+        let k = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([1; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        });
+        SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::try_from(vec![k]).unwrap(),
+                    read_write: VecM::default(),
+                },
+                instructions: 1000,
+                disk_read_bytes: 500,
+                write_bytes: 200,
+            },
+            resource_fee: 10000,
+        }
+    }
+
+    #[test]
+    fn test_build_restore_footprint_tx_round_trip() {
+        let soroban_data = create_test_soroban_data();
+        let params = RestoreFootprintParams {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            sequence: 10,
+            fee: 10_200,
+            soroban_data,
+        };
+        let envelope = build_restore_footprint_tx(&params).unwrap();
+        let raw = STANDARD.decode(&envelope).unwrap();
+        let mut cursor = std::io::Cursor::new(&raw);
+        let mut l = Limited::new(&mut cursor, Limits::none());
+        let env = TransactionEnvelope::read_xdr(&mut l).unwrap();
+        match env {
+            TransactionEnvelope::Tx(v1) => {
+                assert_eq!(v1.tx.seq_num.0, 10);
+                assert_eq!(v1.tx.fee, 10_200);
+                match &v1.tx.operations[0].body {
+                    OperationBody::RestoreFootprint(_) => {
+                        // RestoreFootprintOp only has ext field (V0)
+                    }
+                    other => panic!("expected RestoreFootprint, got {other:?}"),
+                }
+                // Verify the SorobanTransactionData from preamble is preserved
+                match &v1.tx.ext {
+                    TransactionExt::V1(soroban_data) => {
+                        assert_eq!(soroban_data.resource_fee, 10000);
+                        assert_eq!(soroban_data.resources.instructions, 1000);
+                        assert!(!soroban_data.resources.footprint.read_only.is_empty());
+                    }
+                    other => panic!("expected V1 extension, got {other:?}"),
+                }
+            }
+            other => panic!("expected v1 envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_restore_footprint_tx_preserves_preamble_footprint() {
+        let soroban_data = create_test_soroban_data();
+        let original_footprint_keys = soroban_data.resources.footprint.read_only.clone();
+
+        let params = RestoreFootprintParams {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            sequence: 11,
+            fee: 10_300,
+            soroban_data,
+        };
+        let envelope = build_restore_footprint_tx(&params).unwrap();
+        let raw = STANDARD.decode(&envelope).unwrap();
+        let mut cursor = std::io::Cursor::new(&raw);
+        let mut l = Limited::new(&mut cursor, Limits::none());
+        let env = TransactionEnvelope::read_xdr(&mut l).unwrap();
+        match env {
+            TransactionEnvelope::Tx(v1) => match &v1.tx.ext {
+                TransactionExt::V1(soroban_data) => {
+                    assert_eq!(
+                        soroban_data.resources.footprint.read_only,
+                        original_footprint_keys
+                    );
+                }
+                other => panic!("expected V1 extension, got {other:?}"),
+            },
+            other => panic!("expected v1 envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_restore_footprint_tx_fee_floor_enforcement() {
+        let soroban_data = create_test_soroban_data();
+        let min_fee = soroban_data.resource_fee as u32;
+
+        // Test with fee exactly at minimum
+        let params = RestoreFootprintParams {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            sequence: 12,
+            fee: min_fee,
+            soroban_data: soroban_data.clone(),
+        };
+        assert!(build_restore_footprint_tx(&params).is_ok());
+
+        // Test with fee above minimum
+        let params = RestoreFootprintParams {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            sequence: 13,
+            fee: min_fee + 100,
+            soroban_data: soroban_data.clone(),
+        };
+        assert!(build_restore_footprint_tx(&params).is_ok());
+
+        // A fee below the preamble resource fee is rejected, not submitted.
+        let params = RestoreFootprintParams {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            sequence: 14,
+            fee: min_fee - 1,
+            soroban_data,
+        };
+        let err = build_restore_footprint_tx(&params).unwrap_err();
+        assert!(err.to_string().contains("below the preamble resource fee"));
+    }
+
+    #[test]
+    fn test_build_restore_footprint_tx_rejects_empty_footprint() {
+        let mut soroban_data = create_test_soroban_data();
+        soroban_data.resources.footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: VecM::default(),
+        };
+        let params = RestoreFootprintParams {
+            source_account: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".into(),
+            sequence: 15,
+            fee: 20_000,
+            soroban_data,
+        };
+        let err = build_restore_footprint_tx(&params).unwrap_err();
+        assert!(err.to_string().contains("footprint is empty"));
     }
 }
