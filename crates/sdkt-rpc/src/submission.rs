@@ -5,8 +5,79 @@
 //! [`SorobanRpcClient`] for all HTTP/JSON-RPC transport.
 
 use crate::{RpcError, SorobanRpcClient};
+use base64::Engine as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::time::Duration;
+use stellar_xdr::{
+    InnerTransactionResultResult, InvokeHostFunctionResult, Limits, OperationResult,
+    OperationResultTr, ReadXdr, TransactionMeta, TransactionResult, TransactionResultResult,
+    WriteXdr,
+};
+
+/// Extract contract-event XDR entries from a settled `resultMetaXdr` value.
+///
+/// Soroban events live in the V3 transaction-level meta. V4 keeps operation
+/// events alongside transaction-level events, whose stages place them before
+/// all operations, after this transaction, or after all transactions.
+pub fn extract_contract_events(result_meta_xdr: Option<&str>) -> Vec<String> {
+    let Some(encoded) = result_meta_xdr else {
+        return Vec::new();
+    };
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return Vec::new();
+    };
+    let Ok(meta) = TransactionMeta::from_xdr(
+        &raw,
+        Limits {
+            depth: 64,
+            len: 1_048_576,
+        },
+    ) else {
+        return Vec::new();
+    };
+
+    let events = match meta {
+        TransactionMeta::V3(meta) => meta
+            .soroban_meta
+            .map(|soroban| soroban.events.into_iter().collect())
+            .unwrap_or_default(),
+        TransactionMeta::V4(meta) => {
+            let mut events = Vec::new();
+            let mut after_tx = Vec::new();
+            let mut after_all_txs = Vec::new();
+
+            for transaction_event in meta.events {
+                match transaction_event.stage {
+                    stellar_xdr::TransactionEventStage::BeforeAllTxs => {
+                        events.push(transaction_event.event)
+                    }
+                    stellar_xdr::TransactionEventStage::AfterTx => {
+                        after_tx.push(transaction_event.event)
+                    }
+                    stellar_xdr::TransactionEventStage::AfterAllTxs => {
+                        after_all_txs.push(transaction_event.event)
+                    }
+                }
+            }
+
+            events.extend(
+                meta.operations
+                    .into_iter()
+                    .flat_map(|operation| operation.events.into_iter()),
+            );
+            events.extend(after_tx);
+            events.extend(after_all_txs);
+            events
+        }
+        TransactionMeta::V0(_) | TransactionMeta::V1(_) | TransactionMeta::V2(_) => Vec::new(),
+    };
+
+    events
+        .into_iter()
+        .filter_map(|event| event.to_xdr(Limits::none()).ok())
+        .map(|event| base64::engine::general_purpose::STANDARD.encode(event))
+        .collect()
+}
 
 /// Helper to deserialize either a string or an integer into an Option<String>.
 fn deserialize_optional_string_or_int<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -123,15 +194,21 @@ pub struct SubmissionResult {
     pub status: TransactionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_xdr: Option<String>,
+    /// Raw base64 ContractEvent XDR emitted by a successful Soroban transaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_ledger: Option<String>,
-    /// Error code from sendTransaction (e.g. "tx_bad_auth"), when status == Failed.
+    /// Error code when status == Failed: the immediate-rejection code from
+    /// sendTransaction, or the settled on-chain code from `getTransaction`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
-    /// Base64 TransactionResult XDR from sendTransaction, when status == Failed.
+    /// Base64 TransactionResult XDR when status == Failed (immediate
+    /// rejection or settled failure).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_result_xdr: Option<String>,
-    /// Diagnostic events (base64 ContractEvent XDR) from sendTransaction, when status == Failed.
+    /// Diagnostic events (base64 ContractEvent XDR) when status == Failed
+    /// (immediate rejection or settled failure).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_events: Vec<String>,
 }
@@ -200,6 +277,7 @@ pub async fn submit_and_wait(
             hash,
             status: TransactionStatus::Failed,
             result_xdr: None,
+            events: Vec::new(),
             latest_ledger: sent.latest_ledger,
             error_code: sent.error_result,
             error_result_xdr: sent.error_result_xdr,
@@ -212,6 +290,7 @@ pub async fn submit_and_wait(
             hash,
             status: TransactionStatus::Pending,
             result_xdr: None,
+            events: Vec::new(),
             latest_ledger: None,
             error_code: None,
             error_result_xdr: None,
@@ -219,6 +298,133 @@ pub async fn submit_and_wait(
         });
     }
     poll_transaction(client, &hash, config).await
+}
+
+/// Derive the most specific error code available for a settled FAILED
+/// transaction: the network's own `error` string when present, otherwise the
+/// deepest code decoded from the settled `result_xdr` `TransactionResult`.
+/// Falls back to `"tx_failed"` so the field is never empty on this path.
+fn settled_error_code(res: &TransactionStatusResponse) -> String {
+    if let Some(err) = res.error.as_deref() {
+        let err = err.trim();
+        if !err.is_empty() {
+            return err.to_string();
+        }
+    }
+    if let Some(code) = res
+        .result_xdr
+        .as_deref()
+        .and_then(decode_transaction_result_code)
+    {
+        return code;
+    }
+    "tx_failed".to_string()
+}
+
+/// Decode a base64 `TransactionResult` and describe its most specific
+/// failure code (`tx_bad_auth`, `invoke_host_function_trapped`, ...).
+fn decode_transaction_result_code(encoded: &str) -> Option<String> {
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let tx = TransactionResult::from_xdr(
+        &raw,
+        Limits {
+            depth: 32,
+            len: 1_048_576,
+        },
+    )
+    .ok()?;
+    Some(describe_transaction_result(&tx.result))
+}
+
+fn describe_transaction_result(result: &TransactionResultResult) -> String {
+    match result {
+        // A fee-bump wrapper carries no failure of its own; the inner
+        // transaction result holds the operative code.
+        TransactionResultResult::TxFeeBumpInnerSuccess(pair)
+        | TransactionResultResult::TxFeeBumpInnerFailed(pair) => match &pair.result.result {
+            InnerTransactionResultResult::TxFailed(ops) => describe_failed_ops(ops),
+            InnerTransactionResultResult::TxSuccess(_) => "tx_success".to_string(),
+            InnerTransactionResultResult::TxTooEarly => "tx_too_early".to_string(),
+            InnerTransactionResultResult::TxTooLate => "tx_too_late".to_string(),
+            InnerTransactionResultResult::TxMissingOperation => "tx_missing_operation".to_string(),
+            InnerTransactionResultResult::TxBadSeq => "tx_bad_seq".to_string(),
+            InnerTransactionResultResult::TxBadAuth => "tx_bad_auth".to_string(),
+            InnerTransactionResultResult::TxInsufficientBalance => {
+                "tx_insufficient_balance".to_string()
+            }
+            InnerTransactionResultResult::TxNoAccount => "tx_no_account".to_string(),
+            InnerTransactionResultResult::TxInsufficientFee => "tx_insufficient_fee".to_string(),
+            InnerTransactionResultResult::TxBadAuthExtra => "tx_bad_auth_extra".to_string(),
+            InnerTransactionResultResult::TxInternalError => "tx_internal_error".to_string(),
+            InnerTransactionResultResult::TxNotSupported => "tx_not_supported".to_string(),
+            InnerTransactionResultResult::TxBadSponsorship => "tx_bad_sponsorship".to_string(),
+            InnerTransactionResultResult::TxBadMinSeqAgeOrGap => {
+                "tx_bad_min_seq_age_or_gap".to_string()
+            }
+            InnerTransactionResultResult::TxMalformed => "tx_malformed".to_string(),
+            InnerTransactionResultResult::TxSorobanInvalid => "tx_soroban_invalid".to_string(),
+            InnerTransactionResultResult::TxFrozenKeyAccessed => {
+                "tx_frozen_key_accessed".to_string()
+            }
+        },
+        TransactionResultResult::TxSuccess(_) => "tx_success".to_string(),
+        TransactionResultResult::TxFailed(ops) => describe_failed_ops(ops),
+        TransactionResultResult::TxTooEarly => "tx_too_early".to_string(),
+        TransactionResultResult::TxTooLate => "tx_too_late".to_string(),
+        TransactionResultResult::TxMissingOperation => "tx_missing_operation".to_string(),
+        TransactionResultResult::TxBadSeq => "tx_bad_seq".to_string(),
+        TransactionResultResult::TxBadAuth => "tx_bad_auth".to_string(),
+        TransactionResultResult::TxInsufficientBalance => "tx_insufficient_balance".to_string(),
+        TransactionResultResult::TxNoAccount => "tx_no_account".to_string(),
+        TransactionResultResult::TxInsufficientFee => "tx_insufficient_fee".to_string(),
+        TransactionResultResult::TxBadAuthExtra => "tx_bad_auth_extra".to_string(),
+        TransactionResultResult::TxInternalError => "tx_internal_error".to_string(),
+        TransactionResultResult::TxNotSupported => "tx_not_supported".to_string(),
+        TransactionResultResult::TxBadSponsorship => "tx_bad_sponsorship".to_string(),
+        TransactionResultResult::TxBadMinSeqAgeOrGap => "tx_bad_min_seq_age_or_gap".to_string(),
+        TransactionResultResult::TxMalformed => "tx_malformed".to_string(),
+        TransactionResultResult::TxSorobanInvalid => "tx_soroban_invalid".to_string(),
+        TransactionResultResult::TxFrozenKeyAccessed => "tx_frozen_key_accessed".to_string(),
+    }
+}
+
+/// Name the first non-success operation in a `TxFailed` result, drilling
+/// into invoke-host-function results (the dominant Soroban failure shape).
+fn describe_failed_ops(ops: &[OperationResult]) -> String {
+    ops.iter()
+        .filter_map(describe_operation_result)
+        .find(|code| code != "invoke_host_function_success")
+        .unwrap_or_else(|| "tx_failed".to_string())
+}
+
+fn describe_operation_result(op: &OperationResult) -> Option<String> {
+    match op {
+        OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => Some(match r {
+            InvokeHostFunctionResult::Success(_) => "invoke_host_function_success".to_string(),
+            InvokeHostFunctionResult::Malformed => "invoke_host_function_malformed".to_string(),
+            InvokeHostFunctionResult::Trapped => "invoke_host_function_trapped".to_string(),
+            InvokeHostFunctionResult::ResourceLimitExceeded => {
+                "invoke_host_function_resource_limit_exceeded".to_string()
+            }
+            InvokeHostFunctionResult::EntryArchived => {
+                "invoke_host_function_entry_archived".to_string()
+            }
+            InvokeHostFunctionResult::InsufficientRefundableFee => {
+                "invoke_host_function_insufficient_refundable_fee".to_string()
+            }
+        }),
+        // A non-invoke operation result carries no deeper machine code worth
+        // surfacing; the caller falls back to the `tx_failed` level.
+        OperationResult::OpInner(_) => None,
+        OperationResult::OpBadAuth => Some("op_bad_auth".to_string()),
+        OperationResult::OpNoAccount => Some("op_no_account".to_string()),
+        OperationResult::OpNotSupported => Some("op_not_supported".to_string()),
+        OperationResult::OpTooManySubentries => Some("op_too_many_subentries".to_string()),
+        OperationResult::OpExceededWorkLimit => Some("op_exceeded_work_limit".to_string()),
+        OperationResult::OpTooManySponsoring => Some("op_too_many_sponsoring".to_string()),
+    }
 }
 
 /// Poll `getTransaction` until the transaction settles or the timeout elapses.
@@ -239,6 +445,7 @@ pub async fn poll_transaction(
                     hash: hash.to_string(),
                     status,
                     result_xdr: res.result_xdr,
+                    events: extract_contract_events(res.result_meta_xdr.as_deref()),
                     latest_ledger: res.latest_ledger,
                     error_code: None,
                     error_result_xdr: None,
@@ -246,14 +453,16 @@ pub async fn poll_transaction(
                 });
             }
             TransactionStatus::Failed => {
+                let error_code = settled_error_code(&res);
                 return Ok(SubmissionResult {
                     hash: hash.to_string(),
                     status,
-                    result_xdr: res.result_xdr,
+                    result_xdr: res.result_xdr.clone(),
+                    events: Vec::new(),
                     latest_ledger: res.latest_ledger,
-                    error_code: None,
-                    error_result_xdr: None,
-                    diagnostic_events: Vec::new(),
+                    error_code: Some(error_code),
+                    error_result_xdr: res.result_xdr,
+                    diagnostic_events: extract_contract_events(res.result_meta_xdr.as_deref()),
                 });
             }
             TransactionStatus::NotFound | TransactionStatus::Pending => {
@@ -334,6 +543,7 @@ mod tests {
             hash: "abc".to_string(),
             status: TransactionStatus::Success,
             result_xdr: Some("xdr".to_string()),
+            events: Vec::new(),
             latest_ledger: Some("100".to_string()),
             error_code: None,
             error_result_xdr: None,
@@ -341,6 +551,86 @@ mod tests {
         };
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["status"], "Success");
+        assert!(v.get("events").is_none());
+    }
+
+    #[test]
+    fn extracts_raw_events_from_v3_transaction_meta() {
+        use stellar_xdr::{ContractEvent, Limits, SorobanTransactionMeta, TransactionMetaV3};
+
+        let event = ContractEvent::default();
+        let meta = TransactionMeta::V3(TransactionMetaV3 {
+            soroban_meta: Some(SorobanTransactionMeta {
+                events: vec![event.clone()].try_into().unwrap(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(meta.to_xdr(Limits::none()).unwrap());
+        let expected =
+            base64::engine::general_purpose::STANDARD.encode(event.to_xdr(Limits::none()).unwrap());
+
+        assert_eq!(extract_contract_events(Some(&encoded)), vec![expected]);
+    }
+
+    #[test]
+    fn extracts_v4_transaction_and_operation_events_in_stage_order() {
+        use stellar_xdr::{
+            ContractEvent, ContractEventType, Limits, OperationMetaV2, TransactionEvent,
+            TransactionEventStage, TransactionMetaV4,
+        };
+
+        let before = ContractEvent {
+            type_: ContractEventType::System,
+            ..Default::default()
+        };
+        let operation = ContractEvent {
+            type_: ContractEventType::Contract,
+            ..Default::default()
+        };
+        let after = ContractEvent {
+            type_: ContractEventType::Diagnostic,
+            ..Default::default()
+        };
+        let meta = TransactionMeta::V4(TransactionMetaV4 {
+            operations: vec![OperationMetaV2 {
+                events: vec![operation.clone()].try_into().unwrap(),
+                ..Default::default()
+            }]
+            .try_into()
+            .unwrap(),
+            events: vec![
+                TransactionEvent {
+                    stage: TransactionEventStage::BeforeAllTxs,
+                    event: before.clone(),
+                },
+                TransactionEvent {
+                    stage: TransactionEventStage::AfterTx,
+                    event: after.clone(),
+                },
+            ]
+            .try_into()
+            .unwrap(),
+            ..Default::default()
+        });
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(meta.to_xdr(Limits::none()).unwrap());
+        let expected = [before, operation, after]
+            .into_iter()
+            .map(|event| {
+                base64::engine::general_purpose::STANDARD
+                    .encode(event.to_xdr(Limits::none()).unwrap())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(extract_contract_events(Some(&encoded)), expected);
+    }
+
+    #[test]
+    fn empty_or_invalid_meta_has_no_events() {
+        assert!(extract_contract_events(None).is_empty());
+        assert!(extract_contract_events(Some("not-xdr")).is_empty());
     }
 
     #[test]
@@ -409,5 +699,184 @@ mod tests {
         assert_eq!(result.error_code.as_deref(), Some("tx_bad_auth"));
         assert_eq!(result.error_result_xdr.as_deref(), Some("AAAA"));
         assert_eq!(result.diagnostic_events, vec!["AAAAevent"]);
+    }
+
+    // ── #69: settled-failure diagnostics on the polling path ──────────
+
+    fn failed_result_xdr(result: stellar_xdr::TransactionResultResult) -> String {
+        use stellar_xdr::{TransactionResult, TransactionResultExt};
+        let tx = TransactionResult {
+            fee_charged: 100,
+            result,
+            ext: TransactionResultExt::V0,
+        };
+        base64::engine::general_purpose::STANDARD.encode(tx.to_xdr(Limits::none()).unwrap())
+    }
+
+    fn trapped_invoke_xdr() -> String {
+        use stellar_xdr::{
+            InvokeHostFunctionResult, OperationResult, OperationResultTr, TransactionResultResult,
+        };
+        failed_result_xdr(TransactionResultResult::TxFailed(
+            vec![OperationResult::OpInner(
+                OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Trapped),
+            )]
+            .try_into()
+            .unwrap(),
+        ))
+    }
+
+    fn meta_with_one_event() -> (String, String) {
+        use stellar_xdr::{ContractEvent, SorobanTransactionMeta, TransactionMetaV3};
+        let event = ContractEvent::default();
+        let meta = TransactionMeta::V3(TransactionMetaV3 {
+            soroban_meta: Some(SorobanTransactionMeta {
+                events: vec![event.clone()].try_into().unwrap(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let meta_b64 =
+            base64::engine::general_purpose::STANDARD.encode(meta.to_xdr(Limits::none()).unwrap());
+        let event_b64 =
+            base64::engine::general_purpose::STANDARD.encode(event.to_xdr(Limits::none()).unwrap());
+        (meta_b64, event_b64)
+    }
+
+    async fn poll_once_against(result_body: serde_json::Value) -> SubmissionResult {
+        let body = result_body.to_string();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap();
+            let _req = String::from_utf8_lossy(&buf[..n]).to_string();
+
+            let http_resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            sock.write_all(http_resp.as_bytes()).await.unwrap();
+            let _ = sock.shutdown().await;
+        });
+
+        let client = SorobanRpcClient::new(&format!("http://{}", addr));
+        poll_transaction(
+            &client,
+            "abc123",
+            &PollConfig {
+                timeout: Duration::from_secs(5),
+                interval: Duration::from_millis(10),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn poll_failed_prefers_network_error_string() {
+        let trapped = trapped_invoke_xdr();
+        let res = poll_once_against(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "hash": "abc123", "status": "FAILED", "latestLedger": "100",
+                "resultXdr": trapped, "resultMetaXdr": null, "error": "tx_failed"
+            }
+        }))
+        .await;
+
+        assert_eq!(res.status, TransactionStatus::Failed);
+        assert_eq!(res.error_code.as_deref(), Some("tx_failed"));
+        assert_eq!(res.error_result_xdr.as_deref(), Some(trapped.as_str()));
+        assert!(res.diagnostic_events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_failed_decodes_invoke_trap_and_keeps_meta_events() {
+        let trapped = trapped_invoke_xdr();
+        let (meta_b64, event_b64) = meta_with_one_event();
+        let res = poll_once_against(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {
+                "hash": "abc123", "status": "FAILED", "latestLedger": "100",
+                "resultXdr": trapped, "resultMetaXdr": meta_b64, "error": null
+            }
+        }))
+        .await;
+
+        assert_eq!(res.status, TransactionStatus::Failed);
+        assert_eq!(
+            res.error_code.as_deref(),
+            Some("invoke_host_function_trapped")
+        );
+        assert_eq!(res.error_result_xdr.as_deref(), Some(trapped.as_str()));
+        assert_eq!(res.result_xdr.as_deref(), Some(trapped.as_str()));
+        assert_eq!(res.diagnostic_events, vec![event_b64]);
+    }
+
+    #[tokio::test]
+    async fn poll_failed_without_any_diagnostics_still_names_the_failure() {
+        let res = poll_once_against(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": {"hash": "abc123", "status": "FAILED", "latestLedger": "100"}
+        }))
+        .await;
+
+        assert_eq!(res.status, TransactionStatus::Failed);
+        assert_eq!(res.error_code.as_deref(), Some("tx_failed"));
+        assert_eq!(res.error_result_xdr, None);
+        assert!(res.diagnostic_events.is_empty());
+    }
+
+    #[test]
+    fn settled_error_maps_top_level_result_codes() {
+        use stellar_xdr::TransactionResultResult;
+        let cases = [
+            (TransactionResultResult::TxBadAuth, "tx_bad_auth"),
+            (TransactionResultResult::TxBadSeq, "tx_bad_seq"),
+            (
+                TransactionResultResult::TxInsufficientBalance,
+                "tx_insufficient_balance",
+            ),
+            (
+                TransactionResultResult::TxSorobanInvalid,
+                "tx_soroban_invalid",
+            ),
+        ];
+        for (result, expected) in cases {
+            let raw = serde_json::json!({
+                "status": "FAILED",
+                "resultXdr": failed_result_xdr(result),
+                "error": null
+            });
+            let resp: TransactionStatusResponse = serde_json::from_value(raw).unwrap();
+            assert_eq!(settled_error_code(&resp), expected);
+        }
+    }
+
+    #[test]
+    fn settled_error_names_fee_bump_inner_tx_code() {
+        use stellar_xdr::{
+            Hash, InnerTransactionResult, InnerTransactionResultPair, TransactionResultResult,
+        };
+        let pair = InnerTransactionResultPair {
+            transaction_hash: Hash::default(),
+            result: InnerTransactionResult {
+                fee_charged: 100,
+                result: stellar_xdr::InnerTransactionResultResult::TxBadAuth,
+                ext: Default::default(),
+            },
+        };
+        let raw = serde_json::json!({
+            "status": "FAILED",
+            "resultXdr": failed_result_xdr(TransactionResultResult::TxFeeBumpInnerFailed(pair)),
+            "error": null
+        });
+        let resp: TransactionStatusResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(settled_error_code(&resp), "tx_bad_auth");
     }
 }

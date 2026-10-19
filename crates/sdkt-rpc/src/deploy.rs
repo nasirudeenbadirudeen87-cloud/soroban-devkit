@@ -1,8 +1,6 @@
 use crate::error::RpcError;
 use crate::simulate::simulate_transaction;
-use crate::submission::{
-    send_transaction, submit_and_wait, PollConfig, SendTransactionResponse, TransactionStatus,
-};
+use crate::submission::{submit_and_wait, PollConfig, TransactionStatus};
 use crate::SorobanRpcClient;
 use sdkt_xdr::sign::{Ed25519Signer, Network, SigningOptions};
 use sdkt_xdr::sign_transaction;
@@ -107,6 +105,7 @@ pub fn generate_salt() -> [u8; 20] {
 }
 
 /// Upload a WASM binary to the network.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_wasm(
     client: &SorobanRpcClient,
     wasm_bytes: &[u8],
@@ -115,6 +114,7 @@ pub async fn upload_wasm(
     fee: u32,
     network: Network,
     signer: &Ed25519Signer,
+    poll: &PollConfig,
 ) -> Result<(String, String, u32), RpcError> {
     use sdkt_xdr::builder::UploadWasmParams;
 
@@ -205,12 +205,10 @@ pub async fn upload_wasm(
     let signed_envelope = sign_transaction(&final_envelope, signer, &signing_opts)
         .map_err(|e| RpcError::Rpc(format!("Failed to sign upload transaction: {}", e)))?;
 
-    // Submit to network
-    let _response: SendTransactionResponse = send_transaction(client, &signed_envelope).await?;
-
-    // Poll for confirmation
-    let submission_result =
-        submit_and_wait(client, &signed_envelope, true, &PollConfig::default()).await?;
+    // Submit and poll for confirmation. `submit_and_wait` owns the single
+    // sendTransaction call; keeping submission in one place avoids sending the
+    // same signed create transaction twice.
+    let submission_result = submit_and_wait(client, &signed_envelope, true, poll).await?;
 
     if submission_result.status != TransactionStatus::Success {
         let diag = if let Some(ref xdr) = submission_result.error_result_xdr {
@@ -237,6 +235,7 @@ pub async fn upload_wasm(
 }
 
 /// Create a contract instance from an uploaded WASM.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_contract(
     client: &SorobanRpcClient,
     args: &CreateContractArgs,
@@ -244,6 +243,7 @@ pub async fn create_contract(
     fee: u32,
     network: Network,
     signer: &Ed25519Signer,
+    poll: &PollConfig,
 ) -> Result<(String, String, u32), RpcError> {
     use sdkt_xdr::builder::{
         build_create_contract_tx_with_data, build_create_contract_tx_with_data_and_auth,
@@ -371,12 +371,10 @@ pub async fn create_contract(
     let signed_envelope = sign_transaction(&final_envelope, signer, &signing_opts)
         .map_err(|e| RpcError::Rpc(format!("Failed to sign create transaction: {}", e)))?;
 
-    // Submit to network
-    let _response: SendTransactionResponse = send_transaction(client, &signed_envelope).await?;
-
-    // Poll for confirmation
-    let submission_result =
-        submit_and_wait(client, &signed_envelope, true, &PollConfig::default()).await?;
+    // Submit and poll for confirmation. `submit_and_wait` owns the single
+    // sendTransaction call; keeping submission in one place avoids sending the
+    // same signed create transaction twice.
+    let submission_result = submit_and_wait(client, &signed_envelope, true, poll).await?;
 
     if submission_result.status != TransactionStatus::Success {
         let diag = if let Some(ref xdr) = submission_result.error_result_xdr {
@@ -413,6 +411,7 @@ pub async fn create_contract(
 }
 
 /// Deploy a contract: upload WASM, then create contract instance.
+#[allow(clippy::too_many_arguments)]
 pub async fn deploy_contract(
     client: &SorobanRpcClient,
     wasm_bytes: &[u8],
@@ -420,6 +419,7 @@ pub async fn deploy_contract(
     signer: &Ed25519Signer,
     network: Network,
     user_salt: Option<[u8; 20]>,
+    poll: &PollConfig,
 ) -> Result<DeployOutcome, RpcError> {
     deploy_contract_with_args(
         client,
@@ -429,11 +429,13 @@ pub async fn deploy_contract(
         network,
         user_salt,
         Vec::new(),
+        poll,
     )
     .await
 }
 
 /// Deploy a contract with constructor arguments: upload WASM, then create contract instance.
+#[allow(clippy::too_many_arguments)]
 pub async fn deploy_contract_with_args(
     client: &SorobanRpcClient,
     wasm_bytes: &[u8],
@@ -442,6 +444,7 @@ pub async fn deploy_contract_with_args(
     network: Network,
     user_salt: Option<[u8; 20]>,
     constructor_args: Vec<String>,
+    poll: &PollConfig,
 ) -> Result<DeployOutcome, RpcError> {
     use crate::account::get_next_sequence;
 
@@ -477,6 +480,7 @@ pub async fn deploy_contract_with_args(
         100,
         network.clone(),
         signer,
+        poll,
     )
     .await
     {
@@ -496,7 +500,7 @@ pub async fn deploy_contract_with_args(
     };
 
     let (contract_id, create_hash, create_fee) =
-        match create_contract(client, &create_args, sequence, 100, network, signer).await {
+        match create_contract(client, &create_args, sequence, 100, network, signer, poll).await {
             Ok(result) => result,
             Err(e) => {
                 return Ok(DeployOutcome::Partial(PartialDeployResult {
@@ -519,6 +523,70 @@ pub async fn deploy_contract_with_args(
         upload_fee,
         create_fee,
         total_fee,
+    }))
+}
+
+/// Create a contract from already-uploaded WASM code (create-only, no upload).
+///
+/// Skips `upload_wasm` entirely and drives `create_contract` with a
+/// caller-supplied on-chain `wasm_hash` (64-character hex), reusing the same
+/// simulate → sign → submit → poll flow as the full deploy. With the same salt
+/// and the same wasm hash the derived contract ID is identical to what the full
+/// path would have produced, so this resumes a deployment whose upload succeeded
+/// but whose create step failed — without paying the upload fee again.
+///
+/// Never returns `DeployOutcome::Partial` (there is no upload step); a create
+/// failure surfaces as `DeployOutcome::Failure`. The returned `DeployResult`
+/// reports `upload_hash = ""` and `upload_fee = 0`.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_contract_from_hash(
+    client: &SorobanRpcClient,
+    wasm_hash_hex: &str,
+    source_account: &str,
+    signer: &Ed25519Signer,
+    network: Network,
+    user_salt: Option<[u8; 20]>,
+    constructor_args: Vec<String>,
+    poll: &PollConfig,
+) -> Result<DeployOutcome, RpcError> {
+    use crate::account::get_next_sequence;
+
+    // Validate the supplied hash and constructor args up front.
+    let wasm_hash = parse_wasm_hash(wasm_hash_hex)?;
+    sdkt_xdr::parse_scval_args(&constructor_args)
+        .map_err(|e| RpcError::Rpc(format!("Invalid constructor argument: {}", e)))?;
+
+    // Same salt selection as the full deploy path: user-provided or generated.
+    let salt = match user_salt {
+        Some(s) => s,
+        None => generate_salt(),
+    };
+
+    let sequence = get_next_sequence(client, source_account).await?;
+
+    let create_args = CreateContractArgs {
+        wasm_hash,
+        deployer_address: source_account.to_string(),
+        salt,
+        constructor_args,
+    };
+
+    let (contract_id, create_hash, create_fee) =
+        match create_contract(client, &create_args, sequence, 100, network, signer, poll).await {
+            Ok(result) => result,
+            Err(e) => return Ok(DeployOutcome::Failure(format!("Create failed: {}", e))),
+        };
+
+    Ok(DeployOutcome::Success(DeployResult {
+        wasm_hash: hex::encode(wasm_hash),
+        contract_id,
+        upload_hash: String::new(),
+        create_hash,
+        status: "SUCCESS".into(),
+        salt: hex::encode(salt),
+        upload_fee: 0,
+        create_fee,
+        total_fee: create_fee as u64,
     }))
 }
 
@@ -855,6 +923,7 @@ mod tests {
             Network::Testnet,
             None,
             vec!["not_valid_base64_scval".into()],
+            &PollConfig::default(),
         )
         .await;
 

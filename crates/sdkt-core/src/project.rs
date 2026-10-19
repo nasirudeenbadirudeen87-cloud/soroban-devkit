@@ -59,6 +59,8 @@ pub struct ResolvedContract {
     pub alias: String,
     pub path: String,
     pub wasm_artifact: PathBuf,
+    /// Constructor arguments for this contract (TYPE:VALUE pairs or base64 ScVal strings).
+    pub ctor_args: Vec<String>,
 }
 
 /// Resolves the deployment order based on the merged `deploy_after` +
@@ -141,7 +143,7 @@ pub fn resolve_project(config: &DevKitConfig) -> Result<Vec<ResolvedContract>, P
         // Attempt to locate the WASM artifact in the standard target directory
         let target_dir = path
             .join("target")
-            .join("wasm32-unknown-unknown")
+            .join(crate::build::WASM_BUILD_TARGET)
             .join("release");
 
         let mut found_wasm = None;
@@ -164,6 +166,7 @@ pub fn resolve_project(config: &DevKitConfig) -> Result<Vec<ResolvedContract>, P
             alias,
             path: cfg.path.clone(),
             wasm_artifact,
+            ctor_args: cfg.ctor_args.clone(),
         });
     }
 
@@ -185,6 +188,7 @@ mod tests {
                     path: format!("contracts/{}", alias),
                     deploy_after,
                     depends_on,
+                    ctor_args: vec![],
                 },
             );
         }

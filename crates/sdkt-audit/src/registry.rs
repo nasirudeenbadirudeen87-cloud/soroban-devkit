@@ -41,19 +41,34 @@ impl RuleRegistry {
         self.rules.push(rule);
     }
 
-    /// Register the five built-in `sdkt-audit` rules (AUTH-001/002/003/004, MOVE-001)
-    /// in their canonical order.
+    /// Register the built-in `sdkt-audit` rules in their canonical order.
+    ///
+    /// The list comes from [`crate::audit::all_rules`], so the rule set the CLI
+    /// describes and the rule set that executes are the same by construction.
     pub fn register_builtin_rules(&mut self) {
-        self.register_rule(Box::new(crate::rules::Auth001) as BoxedRule);
-        self.register_rule(Box::new(crate::rules::Auth002) as BoxedRule);
-        self.register_rule(Box::new(crate::rules::Auth003) as BoxedRule);
-        self.register_rule(Box::new(crate::rules::Auth004) as BoxedRule);
-        self.register_rule(Box::new(crate::rules::Move001) as BoxedRule);
+        for rule in crate::audit::all_rules() {
+            self.register_rule(rule);
+        }
     }
 
     /// Snapshot of currently registered rules (in registration order).
     pub fn registered_rules(&self) -> &[BoxedRule] {
         &self.rules
+    }
+
+    /// Snapshot of `RuleInfo` for all registered rules in this registry.
+    ///
+    /// Used by the CLI to build SARIF rule metadata and validate `--disable`
+    /// IDs against the exact rule set that will execute.
+    pub fn registered_rule_info(&self) -> Vec<crate::types::RuleInfo> {
+        self.rules
+            .iter()
+            .map(|r| crate::types::RuleInfo {
+                id: r.id().to_string(),
+                severity: r.severity(),
+                description: r.description().to_string(),
+            })
+            .collect()
     }
 
     /// Run every registered rule that is not disabled, appending findings to
@@ -110,6 +125,29 @@ pub fn run_registered(
     reg.run_all(scans, ctx, disabled, report);
 }
 
+/// Snapshot of every rule in the process-wide registry, built-ins plus any
+/// registered plugins, in registration order.
+///
+/// [`crate::audit::all_rules`] returns only the built-in set, so callers that
+/// need to describe *what will actually execute* — `--list-rules`, the SARIF
+/// rule catalogue, `--disable` validation — must read the registry instead.
+/// The registry is populated lazily, so this ensures built-ins first.
+///
+/// Returns owned `RuleInfo` rather than rule references: `Box<dyn AuditRule>`
+/// is not `Clone`, and callers only need the descriptive fields.
+pub fn registered_rule_info() -> Vec<crate::types::RuleInfo> {
+    register_builtin_rules();
+    let reg = global().lock().expect("audit registry poisoned");
+    reg.registered_rules()
+        .iter()
+        .map(|r| crate::types::RuleInfo {
+            id: r.id().to_string(),
+            severity: r.severity(),
+            description: r.description().to_string(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +168,7 @@ mod tests {
         }
         fn check(&self, _s: &[FnScan], _c: &AuditContext, r: &mut AuditReport) {
             r.add(crate::types::Finding {
+                file: None,
                 rule_id: self.id.to_string(),
                 severity: Severity::Info,
                 message: "stub fired".into(),
@@ -171,12 +210,65 @@ mod tests {
     fn builtin_registration_count() {
         let mut reg = RuleRegistry::new();
         reg.register_builtin_rules();
-        assert_eq!(reg.registered_rules().len(), 5, "five built-in rules");
+        assert_eq!(reg.registered_rules().len(), 7, "seven built-in rules");
         let ids: Vec<&str> = reg.registered_rules().iter().map(|r| r.id()).collect();
         assert_eq!(
             ids,
-            vec!["AUTH-001", "AUTH-002", "AUTH-003", "AUTH-004", "MOVE-001"]
+            vec!["AUTH-001", "AUTH-002", "AUTH-003", "AUTH-004", "MOVE-001", "MATH-001", "CEI-001"]
         );
+    }
+
+    /// The registry and `all_rules()` (what `--list-rules` describes and what
+    /// the "Rules loaded" header counts) must be the same rule set in the same
+    /// order. A rule that executes but is not listed — or vice versa — is the
+    /// defect this guards against.
+    #[test]
+    fn registry_matches_all_rules() {
+        let mut reg = RuleRegistry::new();
+        reg.register_builtin_rules();
+        let registered: Vec<&str> = reg.registered_rules().iter().map(|r| r.id()).collect();
+        let described: Vec<&str> = crate::audit::all_rules().iter().map(|r| r.id()).collect();
+        assert_eq!(
+            registered, described,
+            "registry and all_rules() must expose the same rule ids in the same order"
+        );
+
+        // Descriptions and severities are part of `--list-rules` output; a
+        // divergence there is the same class of drift.
+        for rule in crate::audit::all_rules() {
+            let registered_rule = reg
+                .registered_rules()
+                .iter()
+                .find(|r| r.id() == rule.id())
+                .expect("every listed rule must be registered");
+            assert_eq!(
+                registered_rule.description(),
+                rule.description(),
+                "description mismatch for {}",
+                rule.id()
+            );
+            assert_eq!(
+                registered_rule.severity(),
+                rule.severity(),
+                "severity mismatch for {}",
+                rule.id()
+            );
+        }
+    }
+
+    /// Every rule `all_rules()` describes must actually run: executing a scan
+    /// that each rule can fire on must reach the registry, not just the listing.
+    #[test]
+    fn every_builtin_rule_is_reachable_by_id() {
+        let listed: Vec<String> = crate::audit::all_rules()
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert!(
+            listed.contains(&"CEI-001".to_string()),
+            "CEI-001 must be listed: it is registered and executed"
+        );
+        assert_eq!(listed.len(), 7, "seven built-in rules, got {listed:?}");
     }
 
     #[test]

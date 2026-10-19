@@ -129,6 +129,74 @@ fn plugin_install_list_show_remove_lifecycle() {
     let _ = fs::remove_dir_all(&store);
 }
 
+/// #403 review fix: a `--rules` value with a recognized plugin extension
+/// (`wasm`/`so`/`dylib`/`dll`) but a missing file must fail with the
+/// unresolved-path error, not fall through to the "unsupported artifact
+/// format" warning or a confusing "missing build feature" loader error.
+#[test]
+fn rules_missing_recognized_extension_fails_cleanly() {
+    let src = dummy_src(&std::env::temp_dir());
+    for name in ["missing.wasm", "missing.so", "missing.dylib", "missing.dll"] {
+        sdkt()
+            .args(["audit", src.to_str().unwrap(), "--rules", name])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "does not exist and matches no installed plugin",
+            ));
+    }
+}
+
+#[test]
+fn plugin_install_with_id_override_uses_effective_identity() {
+    let store = tempfile::TempDir::new().unwrap();
+    let source = fixture_plugin(store.path());
+    let source = source.to_str().unwrap();
+
+    sdkt()
+        .env("SDKT_PLUGIN_DIR", store.path())
+        .args(["plugin", "install", source, "--id", "override-name"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Installed plugin 'override-name'"));
+
+    sdkt()
+        .env("SDKT_PLUGIN_DIR", store.path())
+        .args(["plugin", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("override-name"));
+
+    sdkt()
+        .env("SDKT_PLUGIN_DIR", store.path())
+        .args(["plugin", "show", "override-name"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("id: override-name"));
+
+    let contract = dummy_src(store.path());
+    sdkt()
+        .env("SDKT_PLUGIN_DIR", store.path())
+        .args([
+            "audit",
+            contract.to_str().unwrap(),
+            "--rules",
+            "override-name",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("wasm-plugins"));
+
+    sdkt()
+        .env("SDKT_PLUGIN_DIR", store.path())
+        .args(["plugin", "remove", "override-name"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed plugin"));
+
+    assert!(!store.path().join("override-name").exists());
+}
+
 /// Parse a command's stdout as JSON, failing with the raw output if it is not.
 fn stdout_json(out: &assert_cmd::assert::Assert) -> serde_json::Value {
     let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
@@ -229,4 +297,93 @@ fn audit_raw_path_still_works_backward_compat() {
         .stderr(predicate::str::contains("wasm-plugins"));
 
     let _ = fs::remove_dir_all(&store);
+}
+
+#[test]
+fn audit_rules_directory_warns_and_runs_builtin_rules() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let source_dir = temp.path().join("rule-source");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("contract.rs");
+    fs::write(&source, "pub fn initialize() {}\n").unwrap();
+
+    sdkt()
+        .args([
+            "audit",
+            source.to_str().unwrap(),
+            "--rules",
+            source_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(source_dir.to_str().unwrap()))
+        .stderr(predicate::str::contains(
+            "a directory is not a loadable plugin artifact",
+        ))
+        .stderr(predicate::str::contains(
+            "pass a .so, .dylib, .dll, or .wasm artifact, or an installed plugin ID",
+        ))
+        .stdout(predicate::str::contains("AUTH-003"));
+}
+
+/// #383 regression: `--list-rules` must report rules from external plugins
+/// passed via `--rules`, not only the built-in set.
+#[test]
+fn list_rules_includes_registered_plugin_rule_info() {
+    // No external plugins are linked into the default test build, so the
+    // registered snapshot must be at least the built-in set — and, unlike the
+    // old `all_rules()` call, it must reflect the process registry that
+    // `--rules` loads into. Assert the baseline holds and is stable across
+    // two invocations of the same process-free CLI run.
+    let first = sdkt()
+        .args(["audit", "--list-rules", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let second = sdkt()
+        .args(["audit", "--list-rules", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let v: serde_json::Value = serde_json::from_slice(&first).expect("list-rules json");
+    let ids: Vec<&str> = v
+        .as_array()
+        .expect("array of rules")
+        .iter()
+        .filter_map(|r| r["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"AUTH-001"),
+        "built-in AUTH-001 must appear: {ids:?}"
+    );
+    assert_eq!(first, second, "listing must be deterministic");
+}
+
+/// #383 regression: an unknown `--disable` id warns on stderr instead of
+/// silently disabling nothing.
+#[test]
+fn disable_unknown_rule_id_warns_on_stderr() {
+    let store = tempfile::TempDir::new().unwrap();
+    let src = dummy_src(store.path());
+
+    sdkt()
+        .env("SDKT_PLUGIN_DIR", store.path())
+        .args(["audit", src.to_str().unwrap(), "--disable", "NOPE-999"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("NOPE-999"))
+        .stderr(predicate::str::contains("does not match any loaded rule"));
+
+    // A known id produces no such warning.
+    sdkt()
+        .env("SDKT_PLUGIN_DIR", store.path())
+        .args(["audit", src.to_str().unwrap(), "--disable", "AUTH-001"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("does not match any loaded rule").not());
 }

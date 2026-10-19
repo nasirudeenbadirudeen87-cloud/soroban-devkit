@@ -30,6 +30,21 @@ pub trait AuditRule {
     fn check(&self, scans: &[FnScan], ctx: &AuditContext, report: &mut AuditReport);
 }
 
+/// Event types for CEI (Checks-Effects-Interactions) ordering tracking.
+///
+/// CEI-001 tracks these events in source order within a function to detect
+/// reentrancy-precondition hazards: when an external contract invocation
+/// appears before a state write in the same function.
+///
+/// See [`crate::rules::Cei001`] for heuristic scope and recognized patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderEvent {
+    /// External contract invocation (invoke_contract, invoke_contract_light, etc.)
+    ExternalCall,
+    /// State write operation (storage().set, storage().write, etc.)
+    StateWrite,
+}
+
 /// Per-function scan result.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FnScan {
@@ -40,6 +55,37 @@ pub struct FnScan {
     pub bound: HashSet<String>,
     /// Argument-usage count per bound local (move heuristic signal).
     pub usage: HashMap<String, usize>,
+    /// True when a division result is subsequently multiplied in this function.
+    #[serde(default)]
+    pub division_before_multiplication: bool,
+    /// True when a recognized external call precedes a recognized state write
+    /// in source order within this function (CEI-001 heuristic hazard).
+    ///
+    /// This is a static-analysis signal only; it does not prove reentrancy or
+    /// exploitability. See [`crate::rules::Cei001`] for heuristic scope and limitations.
+    #[serde(default)]
+    pub external_call_before_state_write: bool,
+    /// Number of recognized state-write operations in this function.
+    ///
+    /// Uses the same recognized method names as CEI-001
+    /// ([`FnVisitor::detect_state_write`]). A function with zero writes and
+    /// zero external calls is a read-only accessor: it cannot be a
+    /// missing-authorization defect, so AUTH-001/AUTH-004 demote it instead of
+    /// reporting it at `critical`.
+    #[serde(default)]
+    pub state_writes: usize,
+    /// True when the function is a contract entrypoint: a method inside a
+    /// `#[contractimpl]` impl block. Soroban contracts only expose such
+    /// methods to external callers; plain `fn` items and methods of
+    /// un-annotated impls are internal helpers, and authorization is the
+    /// responsibility of the entrypoint that calls them.
+    #[serde(default)]
+    pub is_entrypoint: bool,
+    /// True when the declared return type carries a value (not absent, not `()`).
+    /// Combined with zero side effects this is positive evidence of a
+    /// read-only accessor.
+    #[serde(default)]
+    pub returns_value: bool,
 }
 
 impl FnScan {
@@ -50,7 +96,47 @@ impl FnScan {
             invoke_contract: 0,
             bound: HashSet::new(),
             usage: HashMap::new(),
+            division_before_multiplication: false,
+            external_call_before_state_write: false,
+            state_writes: 0,
+            is_entrypoint: false,
+            returns_value: false,
         }
+    }
+
+    /// True when the function mutates state or reaches an external contract.
+    ///
+    /// A pure accessor performs neither, so a name-based privileged match on
+    /// such a function is not evidence of a missing-authorization defect.
+    pub fn performs_side_effect(&self) -> bool {
+        self.state_writes > 0 || self.invoke_contract > 0
+    }
+
+    /// Severity for a name-based privileged-match finding (AUTH-001/AUTH-004).
+    ///
+    /// Mapping (documented in `docs/reference/cli.md`):
+    /// - not an entrypoint (plain `fn` / non-`#[contractimpl]` method) → `info`:
+    ///   external callers cannot reach it; its caller entrypoint holds the auth
+    ///   responsibility. The finding stays visible; nothing is deleted.
+    /// - entrypoint with a recognized side effect (state write or external
+    ///   call) → `critical` (current behavior, e.g. unguarded `mint`,
+    ///   `set_admin`, `pause`).
+    /// - entrypoint returning a value with no recognized side effect → `info`:
+    ///   positive evidence of a read-only getter (`get_paused`, `admin_balance`).
+    /// - entrypoint returning nothing with no *recognized* side effect →
+    ///   `critical`: a setter may write through an unrecognized helper; staying
+    ///   loud is the conservative choice.
+    pub(crate) fn privileged_match_severity(&self) -> Severity {
+        if !self.is_entrypoint {
+            return Severity::Info;
+        }
+        if self.performs_side_effect() {
+            return Severity::Critical;
+        }
+        if self.returns_value {
+            return Severity::Info;
+        }
+        Severity::Critical
     }
 }
 
@@ -63,12 +149,23 @@ fn is_auth_fn(name: &str) -> bool {
 }
 
 /// Heuristic: does this function name look privileged/admin?
+///
+/// Name-only signal. Callers combine it with observed behavior
+/// ([`FnScan::performs_side_effect`]) before assigning severity: a
+/// read-only accessor whose name happens to contain one of these substrings
+/// is not a missing-authorization defect.
 pub(crate) fn is_privileged(name: &str) -> bool {
     let n = unqualified(name).to_lowercase();
     n == "initialize"
         || n.starts_with("initialize_")
         || n == "init"
         || n.starts_with("init_")
+        // Admin setter shapes: `set_owner`, `set_fee`, `grant_role`,
+        // `revoke_role` and friends are the common unguarded-write pattern
+        // (issue #311 false-negative half).
+        || n.starts_with("set_")
+        || n.starts_with("grant_")
+        || n.starts_with("revoke_")
         || [
             "admin",
             "mint",
@@ -85,6 +182,7 @@ pub(crate) fn is_privileged(name: &str) -> bool {
             "transfer_ownership",
             "change_owner",
             "set_auth",
+            "drain",
         ]
         .iter()
         .any(|p| n.contains(p))
@@ -97,7 +195,7 @@ pub(crate) fn is_initialize(name: &str) -> bool {
 }
 
 /// Strip a `Type::` prefix so heuristics match the bare method name.
-fn unqualified(name: &str) -> &str {
+pub(crate) fn unqualified(name: &str) -> &str {
     name.rsplit("::").next().unwrap_or(name)
 }
 
@@ -105,14 +203,39 @@ fn unqualified(name: &str) -> &str {
 /// argument usages of local bindings.
 struct FnVisitor<'a> {
     scan: &'a mut FnScan,
+    divided_bindings: HashSet<String>,
+    /// Ordered sequence of CEI events (external calls and state writes) in source order.
+    order_events: &'a mut Vec<OrderEvent>,
 }
 
 impl<'ast, 'a> Visit<'ast> for FnVisitor<'a> {
     fn visit_local(&mut self, node: &'ast Local) {
         if let Pat::Ident(pat) = &node.pat {
-            self.scan.bound.insert(pat.ident.to_string());
+            let name = pat.ident.to_string();
+            self.scan.bound.insert(name.clone());
+            if let Some(init) = &node.init {
+                if expr_contains_division(&init.expr)
+                    || expr_uses_any(&init.expr, &self.divided_bindings)
+                {
+                    self.divided_bindings.insert(name);
+                } else {
+                    self.divided_bindings.remove(&name);
+                }
+            }
         }
         visit::visit_local(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        if matches!(node.op, syn::BinOp::Mul(_))
+            && (expr_contains_division(&node.left)
+                || expr_contains_division(&node.right)
+                || expr_uses_any(&node.left, &self.divided_bindings)
+                || expr_uses_any(&node.right, &self.divided_bindings))
+        {
+            self.scan.division_before_multiplication = true;
+        }
+        visit::visit_expr_binary(self, node);
     }
 
     fn visit_expr_call(&mut self, node: &'ast ExprCall) {
@@ -122,15 +245,24 @@ impl<'ast, 'a> Visit<'ast> for FnVisitor<'a> {
                 if is_auth_fn(&name) {
                     self.scan.require_auth += 1;
                 }
-                if name == "invoke_contract" {
+            }
+        }
+        // Visit arguments first (to record nested events before this call).
+        for arg in &node.args {
+            self.count_ident(arg);
+            visit::visit_expr(self, arg);
+        }
+        // Then record this call after its arguments are processed.
+        if let Expr::Path(p) = &*node.func {
+            if let Some(seg) = p.path.segments.last() {
+                let name = seg.ident.to_string();
+                if name == "invoke_contract" || name == "invoke_contract_light" {
                     self.scan.invoke_contract += 1;
+                    self.order_events.push(OrderEvent::ExternalCall);
                 }
             }
         }
-        for arg in &node.args {
-            self.count_ident(arg);
-        }
-        visit::visit_expr_call(self, node);
+        // Don't call visit::visit_expr_call since we've already visited arguments.
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
@@ -138,15 +270,73 @@ impl<'ast, 'a> Visit<'ast> for FnVisitor<'a> {
         if is_auth_fn(&method) {
             self.scan.require_auth += 1;
         }
-        if method == "invoke_contract" {
-            self.scan.invoke_contract += 1;
-        }
-        self.count_ident(&node.receiver);
+
+        // Visit receiver first.
+        visit::visit_expr(self, &node.receiver);
+        // Visit arguments.
         for arg in &node.args {
             self.count_ident(arg);
+            visit::visit_expr(self, arg);
         }
-        visit::visit_expr_method_call(self, node);
+
+        // Now record the method call event after nested expressions are processed.
+        if method == "invoke_contract" || method == "invoke_contract_light" {
+            self.scan.invoke_contract += 1;
+            self.order_events.push(OrderEvent::ExternalCall);
+        }
+        // Detect state write patterns: storage().set(...), storage().write(...), etc.
+        self.detect_state_write(&method);
+        // Don't call visit::visit_expr_method_call since we've manually visited children.
     }
+}
+
+fn expr_contains_division(expr: &Expr) -> bool {
+    struct Finder(bool);
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+            if matches!(node.op, syn::BinOp::Div(_))
+                && !(is_constant_expr(&node.left) && is_constant_expr(&node.right))
+            {
+                self.0 = true;
+            }
+            visit::visit_expr_binary(self, node);
+        }
+    }
+    let mut finder = Finder(false);
+    finder.visit_expr(expr);
+    finder.0
+}
+
+fn is_constant_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Lit(literal) => matches!(literal.lit, syn::Lit::Int(_)),
+        Expr::Paren(paren) => is_constant_expr(&paren.expr),
+        Expr::Group(group) => is_constant_expr(&group.expr),
+        Expr::Unary(unary) => is_constant_expr(&unary.expr),
+        Expr::Binary(binary) => is_constant_expr(&binary.left) && is_constant_expr(&binary.right),
+        _ => false,
+    }
+}
+
+fn expr_uses_any(expr: &Expr, names: &HashSet<String>) -> bool {
+    struct Finder<'a> {
+        names: &'a HashSet<String>,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if let Some(name) = node.path.get_ident() {
+                self.found |= self.names.contains(&name.to_string());
+            }
+            visit::visit_expr_path(self, node);
+        }
+    }
+    let mut finder = Finder {
+        names,
+        found: false,
+    };
+    finder.visit_expr(expr);
+    finder.found
 }
 
 impl<'a> FnVisitor<'a> {
@@ -160,12 +350,38 @@ impl<'a> FnVisitor<'a> {
             }
         }
     }
+
+    /// Detect state write patterns and record them in the CEI order events.
+    ///
+    /// Recognized patterns (case-insensitive method names):
+    /// - `set` - Direct storage writes
+    /// - `write` - Alternative write method
+    /// - `put` - Map/collection insertion
+    /// - `remove` - Key removal
+    /// - `delete` - Deletion operation
+    /// - `extend` - Entry extension (e.g., ledger entries)
+    ///
+    /// Note: This is a heuristic based on method names only. Custom state-mutation
+    /// patterns not matching these names will not be detected.
+    fn detect_state_write(&mut self, method_name: &str) {
+        // Common state write patterns in Soroban:
+        // - storage().set(...), storage().write(...)
+        // - map.set(...), map.put(...)
+        // - set(...), put(...), write(...)
+        let patterns = ["set", "write", "put", "remove", "delete", "extend"];
+        if patterns.iter().any(|p| method_name.eq_ignore_ascii_case(p)) {
+            self.order_events.push(OrderEvent::StateWrite);
+            self.scan.state_writes += 1;
+        }
+    }
 }
 
 /// Scan every function in the AST into a `FnScan` per function.
 ///
 /// Covers both top-level `fn` items and methods inside `impl` blocks
-/// (Soroban contract entrypoints are `impl` methods).
+/// (Soroban contract entrypoints are `impl` methods). Methods of an impl
+/// block annotated with `#[contractimpl]` are marked as entrypoints; every
+/// other function is treated as an internal helper.
 pub fn scan_all_functions(ast: &syn::File) -> Vec<FnScan> {
     let mut out = Vec::new();
     for item in &ast.items {
@@ -185,6 +401,7 @@ pub fn scan_all_functions(ast: &syn::File) -> Vec<FnScan> {
                         .unwrap_or_default(),
                     _ => String::new(),
                 };
+                let is_contract_impl = has_contractimpl_attr(&imp.attrs);
                 for inner in &imp.items {
                     if let syn::ImplItem::Fn(m) = inner {
                         let qual = if type_name.is_empty() {
@@ -194,6 +411,7 @@ pub fn scan_all_functions(ast: &syn::File) -> Vec<FnScan> {
                         };
                         let mut scan = fn_scan(&m.sig, &m.block);
                         scan.fn_name = qual;
+                        scan.is_entrypoint = is_contract_impl;
                         out.push(scan);
                     }
                 }
@@ -204,9 +422,38 @@ pub fn scan_all_functions(ast: &syn::File) -> Vec<FnScan> {
     out
 }
 
+/// True when the attribute list contains `#[contractimpl]`
+/// (e.g. `use soroban_sdk::contractimpl;` + `#[contractimpl]`, or the
+/// fully-qualified `#[soroban_sdk::contractimpl]`).
+fn has_contractimpl_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path()
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "contractimpl")
+    })
+}
+
+/// True when a signature declares a return type that carries a value:
+/// any `-> T` except `-> ()`.
+///
+/// `Result<(), E>` counts as returning a value because the reader cannot tell
+/// a write-performing fallible setter from a pure accessor by the type alone;
+/// the side-effect signal decides severity in that shape.
+fn signature_returns_value(sig: &syn::Signature) -> bool {
+    let syn::ReturnType::Type(_, ty) = &sig.output else {
+        return false;
+    };
+    if let syn::Type::Tuple(tuple) = &**ty {
+        return !tuple.elems.is_empty();
+    }
+    true
+}
+
 /// Build a `FnScan` for one function signature + body.
 fn fn_scan(sig: &syn::Signature, block: &syn::Block) -> FnScan {
     let mut scan = FnScan::new(sig.ident.to_string());
+    scan.returns_value = signature_returns_value(sig);
     for input in &sig.inputs {
         if let FnArg::Typed(pt) = input {
             if let Pat::Ident(pat) = &*pt.pat {
@@ -214,8 +461,31 @@ fn fn_scan(sig: &syn::Signature, block: &syn::Block) -> FnScan {
             }
         }
     }
-    let mut visitor = FnVisitor { scan: &mut scan };
+    let mut order_events = Vec::new();
+    let mut visitor = FnVisitor {
+        scan: &mut scan,
+        divided_bindings: HashSet::new(),
+        order_events: &mut order_events,
+    };
     visitor.visit_block(block);
+
+    // Check if any external call precedes any later state write (CEI hazard).
+    // Detect the pattern: external_call → ... → state_write
+    let mut found_external_call = false;
+    for event in order_events {
+        match event {
+            OrderEvent::ExternalCall => {
+                found_external_call = true;
+            }
+            OrderEvent::StateWrite if found_external_call => {
+                // An external call appeared before this state write.
+                scan.external_call_before_state_write = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
     scan
 }
 
@@ -227,14 +497,27 @@ pub fn scan_all_functions_str(src: &str) -> Option<Vec<FnScan>> {
     Some(scan_all_functions(&ast))
 }
 
-/// All built-in rules.
-pub fn all_rules() -> Vec<Box<dyn AuditRule>> {
+/// All built-in rules, in the same order [`crate::registry::RuleRegistry::register_builtin_rules`]
+/// registers them.
+///
+/// This is the single source of truth for the built-in rule set. The CLI uses
+/// it to describe the rule set (`--list-rules`) and to report how many rules
+/// ran. Keeping it in one place prevents the listing from drifting away from
+/// what the registry actually executes.
+///
+/// The rules are returned as `Send + Sync` boxes because the registry stores
+/// them in a process-wide `OnceLock<Mutex<_>>`; every built-in rule is
+/// `Send + Sync`, and callers that need plain `Box<dyn AuditRule>` can coerce
+/// each element.
+pub fn all_rules() -> Vec<Box<dyn AuditRule + Send + Sync>> {
     vec![
         Box::new(crate::rules::Auth001),
         Box::new(crate::rules::Auth002),
         Box::new(crate::rules::Auth003),
         Box::new(crate::rules::Auth004),
         Box::new(crate::rules::Move001),
+        Box::new(crate::rules::Math001),
+        Box::new(crate::rules::Cei001),
     ]
 }
 
@@ -263,6 +546,19 @@ pub fn audit_source_with(src: &str, disabled: &[&str]) -> Result<AuditReport, Au
     run_rules(&ast, &ctx, disabled)
 }
 
+pub fn audit_source_with_registry(
+    src: &str,
+    reg: &crate::registry::RuleRegistry,
+    disabled: &[&str],
+) -> Result<AuditReport, AuditError> {
+    let ast = syn::parse_file(src).map_err(AuditError::Parse)?;
+    let ctx = AuditContext { spec: None };
+    let scans = scan_all_functions(&ast);
+    let mut report = AuditReport::default();
+    reg.run_all(&scans, &ctx, disabled, &mut report);
+    Ok(report)
+}
+
 /// Audit Rust source with an accompanying `ContractSpec` for cross-checking.
 pub fn audit_source_with_spec(
     src: &str,
@@ -278,6 +574,7 @@ pub fn audit_source_with_spec(
 mod tests {
     use super::*;
     use crate::rules::{Auth001, Auth002, Auth003, Move001};
+    use sdkt_wasm::spec::ContractFunction;
 
     fn report_for(src: &str) -> AuditReport {
         audit_source(src).unwrap()
@@ -285,6 +582,39 @@ mod tests {
 
     fn has(rep: &AuditReport, id: &str) -> bool {
         rep.findings.iter().any(|f| f.rule_id == id)
+    }
+
+    #[test]
+    fn audit_source_with_registry_uses_supplied_registry() {
+        struct Stub {
+            id: &'static str,
+        }
+        impl AuditRule for Stub {
+            fn id(&self) -> &'static str {
+                self.id
+            }
+            fn severity(&self) -> Severity {
+                Severity::Info
+            }
+            fn description(&self) -> &'static str {
+                "stub"
+            }
+            fn check(&self, _scans: &[FnScan], _ctx: &AuditContext, report: &mut AuditReport) {
+                report.add(crate::types::Finding {
+                    file: None,
+                    rule_id: self.id.to_string(),
+                    severity: Severity::Info,
+                    message: "stub fired".into(),
+                    location: None,
+                });
+            }
+        }
+
+        let mut reg = crate::registry::RuleRegistry::new();
+        reg.register_builtin_rules();
+        reg.register_rule(Box::new(Stub { id: "REG-TEST" }) as crate::registry::BoxedRule);
+        let rep = audit_source_with_registry("pub fn mint() { }", &reg, &["AUTH-001"]).unwrap();
+        assert!(rep.findings.iter().any(|f| f.rule_id == "REG-TEST"));
     }
 
     #[test]
@@ -344,6 +674,24 @@ mod tests {
     }
 
     #[test]
+    fn auth003_matches_qualified_impl_method_against_unqualified_spec() {
+        let src = "impl Token { pub fn initialize(admin: Address) { } }";
+        let spec = ContractSpec {
+            env_meta: None,
+            functions: vec![ContractFunction {
+                name: "initialize".into(),
+                doc: String::new(),
+                parameters: vec![],
+                outputs: vec![],
+            }],
+            custom_types: vec![],
+            events: vec![],
+        };
+        let rep = audit_source_with_spec(src, &spec, &[]).unwrap();
+        assert!(has(&rep, "AUTH-003"));
+    }
+
+    #[test]
     fn move001_fires_on_double_arg_use() {
         let src = "pub fn foo(a: Address) { bar(a); baz(a); }";
         let rep = report_for(src);
@@ -355,6 +703,191 @@ mod tests {
         let src = "pub fn foo(a: Address) { bar(a); }";
         let rep = report_for(src);
         assert!(!has(&rep, "MOVE-001"));
+    }
+
+    #[test]
+    fn math001_detects_direct_and_intermediate_division_before_multiplication() {
+        for src in [
+            "pub fn quote(amount: i128, bps: i128) -> i128 { amount / 10_000 * bps }",
+            "pub fn quote(amount: i128, bps: i128) -> i128 { (amount / 10_000) * (bps + 1) }",
+            "pub fn quote(amount: i128, bps: i128) -> i128 { let divided = amount / 10_000; divided * bps }",
+        ] {
+            let report = report_for(src);
+            let finding = report
+                .findings
+                .iter()
+                .find(|finding| finding.rule_id == "MATH-001")
+                .expect("division before multiplication should be reported");
+            assert_eq!(finding.severity, Severity::Warning);
+            assert_eq!(finding.location.as_deref(), Some("quote"));
+            assert!(finding.message.contains("divides before multiplying"));
+        }
+    }
+
+    #[test]
+    fn math001_ignores_unrelated_or_non_multiplicative_arithmetic() {
+        for src in [
+            "pub fn quote(amount: i128, bps: i128) -> i128 { amount * bps }",
+            "pub fn quote(bps: i128) -> i128 { 5 / 2 * bps }",
+            "pub fn quote(amount: i128) -> i128 { amount / 10_000 }",
+            "pub fn quote(amount: i128, bps: i128) -> i128 { amount / 10_000 + bps }",
+            "pub fn quote(amount: i128, other: i128, bps: i128) -> i128 { amount / 10_000 + other * bps }",
+            "pub fn quote(amount: i128, other: i128, bps: i128) -> i128 { let divided = amount / 10_000; other * bps + divided }",
+        ] {
+            assert!(
+                !has(&report_for(src), "MATH-001"),
+                "unexpected math finding for {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn math001_can_be_disabled() {
+        let src = "pub fn quote(amount: i128, bps: i128) -> i128 { amount / 10_000 * bps }";
+        assert!(!has(
+            &audit_source_with(src, &["MATH-001"]).unwrap(),
+            "MATH-001"
+        ));
+    }
+
+    #[test]
+    fn cei001_fires_on_external_call_before_state_write() {
+        let src = r#"
+            pub fn swap(env: Env, to: Address) {
+                env.invoke_contract(&pool, sym!("withdraw"), args);
+                env.storage().set(key, value);
+            }
+        "#;
+        let rep = report_for(src);
+        assert!(has(&rep, "CEI-001"));
+    }
+
+    #[test]
+    fn cei001_detects_nested_invoke_in_set_argument() {
+        // set(..., invoke_contract(...)) — the invoke is nested inside set args
+        // Arguments are evaluated before the outer call, so invoke happens before set's effect
+        let src = r#"
+            pub fn swap(env: Env) {
+                env.storage().set(key, env.invoke_contract(&pool, sym, args));
+            }
+        "#;
+        let rep = report_for(src);
+        // The invoke is inside the set's arguments and is evaluated before set's effect.
+        assert!(
+            has(&rep, "CEI-001"),
+            "invoke in set args happens before set's effect"
+        );
+    }
+
+    #[test]
+    fn cei001_detects_invoke_wrapping_set_argument() {
+        // invoke_contract(..., storage().set(...)) — set is nested inside invoke args
+        // Arguments are evaluated before the outer call, so set happens before invoke's effect
+        let src = r#"
+            pub fn swap(env: Env) {
+                env.invoke_contract(&pool, sym, env.storage().set(key, value));
+            }
+        "#;
+        let rep = report_for(src);
+        // The set happens in the arguments before invoke's effect.
+        // This should NOT flag because set comes BEFORE the external call's effect.
+        assert!(
+            !has(&rep, "CEI-001"),
+            "set in invoke args happens before invoke's effect"
+        );
+    }
+
+    #[test]
+    fn cei001_detects_write_call_write_pattern() {
+        // write → invoke → write: has both patterns, should flag on the second write
+        let src = r#"
+            pub fn swap(env: Env) {
+                env.storage().set(key1, value1);
+                env.invoke_contract(&pool, sym!("withdraw"), args);
+                env.storage().set(key2, value2);
+            }
+        "#;
+        let rep = report_for(src);
+        // The first set should not cause a flag (no prior call).
+        // The invoke should set found_external_call = true.
+        // The second set should flag because found_external_call is true.
+        assert!(
+            has(&rep, "CEI-001"),
+            "write → call → write should flag on second write"
+        );
+    }
+
+    #[test]
+    fn cei001_still_emits_one_finding_per_function() {
+        // Multiple write → call → write patterns should still emit only one finding.
+        let src = r#"
+            pub fn swap(env: Env) {
+                env.storage().set(key1, value1);
+                env.invoke_contract(&pool, sym!("withdraw"), args);
+                env.storage().set(key2, value2);
+                env.invoke_contract(&pool2, sym!("transfer"), args);
+                env.storage().set(key3, value3);
+            }
+        "#;
+        let rep = report_for(src);
+        let cei_findings: Vec<_> = rep
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "CEI-001")
+            .collect();
+        assert_eq!(
+            cei_findings.len(),
+            1,
+            "should emit only one CEI-001 finding per function"
+        );
+    }
+
+    #[test]
+    fn cei001_silent_on_state_write_before_external_call() {
+        let src = r#"
+            pub fn swap_safe(env: Env, to: Address) {
+                env.storage().set(key, value);
+                env.invoke_contract(&pool, sym!("withdraw"), args);
+            }
+        "#;
+        let rep = report_for(src);
+        assert!(!has(&rep, "CEI-001"));
+    }
+
+    #[test]
+    fn cei001_silent_on_only_external_call() {
+        let src = r#"
+            pub fn relay(env: Env) {
+                env.invoke_contract(&addr, sym, args);
+            }
+        "#;
+        let rep = report_for(src);
+        assert!(!has(&rep, "CEI-001"));
+    }
+
+    #[test]
+    fn cei001_silent_on_only_state_write() {
+        let src = r#"
+            pub fn set_state(env: Env) {
+                env.storage().set(key, value);
+            }
+        "#;
+        let rep = report_for(src);
+        assert!(!has(&rep, "CEI-001"));
+    }
+
+    #[test]
+    fn cei001_can_be_disabled() {
+        let src = r#"
+            pub fn swap(env: Env) {
+                env.invoke_contract(&addr, sym, args);
+                env.storage().set(key, value);
+            }
+        "#;
+        assert!(
+            !has(&audit_source_with(src, &["CEI-001"]).unwrap(), "CEI-001"),
+            "CEI-001 should be suppressible"
+        );
     }
 
     #[test]

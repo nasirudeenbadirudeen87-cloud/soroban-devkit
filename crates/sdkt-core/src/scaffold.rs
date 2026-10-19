@@ -2,6 +2,22 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+/// The exact `soroban-sdk` version `sdkt init` writes into a generated
+/// `Cargo.toml` (#111). Bump only to a release verified to give a project where
+/// `cargo check`, `cargo test` and `sdkt build` all succeed.
+///
+/// `28.0.0` is the first stable release targeting Protocol 28 (spec shaking v2
+/// always on, contract data migration, executable references). Because shaking is
+/// build-system-driven, a generated contract must be compiled with
+/// `stellar contract build` — which is exactly the path `sdkt build` selects for
+/// a `soroban-sdk >= 28` manifest.
+const SCAFFOLD_SOROBAN_SDK_VERSION: &str = "28.0.0";
+
+/// Minimum Rust for the generated project. `soroban-sdk` 28.0.0 declares
+/// `rust-version = "1.91.0"` (crates.io metadata), above this workspace's own
+/// MSRV, so 1.91 remains correct.
+const SCAFFOLD_RUST_VERSION: &str = "1.91";
+
 /// Configuration for project scaffolding.
 #[derive(Debug, Clone)]
 pub struct ScaffoldConfig {
@@ -52,20 +68,24 @@ pub fn generate_project(config: &ScaffoldConfig) -> io::Result<ScaffoldResult> {
 
     let crate_name = package_name.replace('-', "_");
 
+    // Pinned exactly (#111): a floating requirement let the resolver pick a
+    // `soroban-env-host` whose open `ed25519-dalek` range breaks `testutils`.
+    // `lib` next to `cdylib` lets `tests/basic.rs` link the crate.
     let cargo_toml = format!(
         r#"[package]
 name = "{name}"
 version = "0.1.0"
 edition = "2021"
+rust-version = "{rust}"
 
 [dependencies]
-soroban-sdk = "21.0.0"
+soroban-sdk = "={sdk}"
 
 [dev-dependencies]
-soroban-sdk = {{ version = "21.0.0", features = ["testutils"] }}
+soroban-sdk = {{ version = "={sdk}", features = ["testutils"] }}
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["lib", "cdylib"]
 
 [profile.release]
 opt-level = "z"
@@ -78,6 +98,8 @@ codegen-units = 1
 lto = true
 "#,
         name = package_name,
+        rust = SCAFFOLD_RUST_VERSION,
+        sdk = SCAFFOLD_SOROBAN_SDK_VERSION,
     );
     write_template(root, "Cargo.toml", &cargo_toml, &mut created)?;
 
@@ -98,11 +120,13 @@ impl Contract {
     write_template(root, "src/lib.rs", lib_rs, &mut created)?;
 
     let sdkt_toml = r#"[network]
-default = "testnet"
 rpc_url = "https://soroban-testnet.stellar.org"
+passphrase = "Test SDF Network ; September 2015"
 
-[build]
-target = "wasm32-unknown-unknown"
+[contracts.main]
+path = "."
+# Optional: constructor arguments passed at create time
+# ctor_args = ["address:G...", "u32:100"]
 "#;
     write_template(root, ".sdkt.toml", sdkt_toml, &mut created)?;
 
@@ -110,8 +134,9 @@ target = "wasm32-unknown-unknown"
 
     if !config.minimal {
         let readme = format!(
-            "# {name}\n\nA Soroban smart contract project.\n\n## Build\n\n```\nsdkt build\n```\n\n## Test\n\n```\ncargo test\n```\n",
+            "# {name}\n\nA Soroban smart contract project.\n\n## Build\n\n```\nsdkt build\n```\n\n## Test\n\n```\ncargo test\n```\n\n## Deploy to Testnet\n\nCreate and fund a test identity, then deploy the compiled contract:\n\n```\nsdkt identity generate my-dev\nsdkt network add testnet --rpc-url https://soroban-testnet.stellar.org --passphrase \"Test SDF Network ; September 2015\" --friendbot https://friendbot.stellar.org\nsdkt identity fund my-dev --network-profile testnet\nsdkt deploy --wasm target/wasm32v1-none/release/{crate_name}.wasm --identity my-dev --network-profile testnet\n```\n\n### Constructor Arguments\n\nIf your contract requires initialization parameters, pass them with `--arg`:\n\n```\nsdkt deploy --wasm target/wasm32v1-none/release/{crate_name}.wasm --identity my-dev --network-profile testnet --arg address:G... --arg u32:100\n```\n\nFor multi-contract projects, declare constructor arguments in `.sdkt.toml`:\n\n```toml\n[contracts.main]\npath = \".\"\nctor_args = [\"address:G...\", \"u32:100\"]\n```\n\n## Invoke\n\nReplace `<CONTRACT_ID>` with the deployed contract address:\n\n```\nsdkt call <CONTRACT_ID> hello --network-profile testnet\nsdkt invoke <CONTRACT_ID> hello --identity my-dev --network-profile testnet\n```\n",
             name = package_name,
+            crate_name = crate_name,
         );
         write_template(root, "README.md", &readme, &mut created)?;
 
@@ -128,7 +153,7 @@ use soroban_sdk::Env;
 #[test]
 fn test_hello() {{
     let env = Env::default();
-    let contract_id = env.register_contract(None, Contract);
+    let contract_id = env.register(Contract, ());
     let client = ContractClient::new(&env, &contract_id);
     assert_eq!(client.hello(), 42);
 }}
@@ -162,6 +187,7 @@ pub const PLUGIN_SCAFFOLD_FILES: &[&str] = &[
     "plugin/plugin.toml",
     "plugin-wasm/plugin.toml",
     "README.md",
+    "tests/rule_test.rs",
     ".gitignore",
 ];
 
@@ -297,6 +323,7 @@ pub fn generate_plugin_project(config: &PluginScaffoldConfig) -> io::Result<Scaf
     fs::create_dir_all(root.join("src"))?;
     fs::create_dir_all(root.join("plugin"))?;
     fs::create_dir_all(root.join("plugin-wasm"))?;
+    fs::create_dir_all(root.join("tests"))?;
 
     let mut created = Vec::new();
 
@@ -314,6 +341,9 @@ serde = {{ version = "1", optional = true, features = ["derive"] }}
 serde_json = {{ version = "1", optional = true }}
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sdkt-audit = {{ version = "{audit_version}" }}
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 sdkt-audit = {{ version = "{audit_version}" }}
 
 [features]
@@ -385,6 +415,7 @@ impl AuditRule for {struct_name} {{
         for s in scans {{
             if s.fn_name.contains("{trigger}") {{
                 report.add(Finding {{
+                    file: None,
                     rule_id: self.id().to_string(),
                     severity: self.severity(),
                     message: format!("{{}} matched trigger function `{{}}`", "{rule_id}", s.fn_name),
@@ -408,44 +439,6 @@ mod plugin_abi;
 /// JSON-ABI exports for sandboxed WASM loading (Phase C).
 #[cfg(all(feature = "wasm-plugins", target_arch = "wasm32"))]
 mod plugin_abi_wasm;
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod tests {{
-    use super::*;
-
-    /// Proves the rule is wired, not merely compiling: a trivially-matching
-    /// function name must produce exactly one finding carrying the rule id.
-    #[test]
-    fn rule_fires_on_trigger_function() {{
-        let scans = vec![FnScan {{
-            fn_name: format!("{{}}_admin", "{trigger}"),
-            require_auth: 0,
-            invoke_contract: 0,
-            bound: Default::default(),
-            usage: Default::default(),
-        }}];
-        let ctx = AuditContext {{ spec: None }};
-        let mut report = AuditReport::default();
-        {struct_name}.check(&scans, &ctx, &mut report);
-        assert_eq!(report.summary.total, 1, "placeholder rule must fire on a matching function");
-        assert_eq!(report.findings[0].rule_id, "{rule_id}");
-    }}
-
-    #[test]
-    fn rule_silent_on_normal_function() {{
-        let scans = vec![FnScan {{
-            fn_name: "balance_of".to_string(),
-            require_auth: 0,
-            invoke_contract: 0,
-            bound: Default::default(),
-            usage: Default::default(),
-        }}];
-        let ctx = AuditContext {{ spec: None }};
-        let mut report = AuditReport::default();
-        {struct_name}.check(&scans, &ctx, &mut report);
-        assert!(report.is_clean());
-    }}
-}}
 "#,
         struct_name = struct_name,
         rule_id = rule_id,
@@ -849,10 +842,10 @@ sdkt plugin install plugin-wasm/{lib_name}.wasm
 cargo test --features plugins
 ```
 
-The scaffold ships a unit test that proves the placeholder rule is wired: it
-must produce exactly one finding when a function name contains `{trigger}`, and
-stay silent otherwise. Replace that logic with your real check, then update the
-test.
+The scaffold ships `tests/rule_test.rs` which proves the placeholder rule is
+wired: it must produce exactly one finding when a function name contains
+`{trigger}`, and stay silent otherwise. Replace that logic with your real check,
+then update the test.
 
 See `docs/plugins/plugin-authoring.md` in the Soroban DevKit repository for the full
 authoring guide.
@@ -864,6 +857,71 @@ authoring guide.
         artifact = artifact,
     );
     write_template(root, "README.md", &readme, &mut created)?;
+
+    let rule_test = format!(
+        r#"//! Integration test for the scaffolded plugin rule.
+//!
+//! Proves the placeholder rule is wired end-to-end: a trivially matching
+//! function name produces a finding, while a non-matching name stays silent.
+//! Run with `cargo test --features plugins`.
+
+use {lib_name}::{struct_name};
+use sdkt_audit::{{AuditContext, AuditReport, AuditRule, FnScan}};
+
+/// A function whose name contains the trigger word must produce exactly one
+/// finding carrying the rule id.
+#[test]
+fn rule_fires_on_trigger_function() {{
+    let scans = vec![FnScan {{
+        fn_name: format!("{{}}_admin", "{trigger}"),
+        require_auth: 0,
+        invoke_contract: 0,
+        bound: Default::default(),
+        usage: Default::default(),
+        division_before_multiplication: false,
+        external_call_before_state_write: false,
+        state_writes: 0,
+        is_entrypoint: true,
+        returns_value: false,
+    }}];
+    let ctx = AuditContext {{ spec: None }};
+    let mut report = AuditReport::default();
+    {struct_name}.check(&scans, &ctx, &mut report);
+    assert_eq!(
+        report.summary.total, 1,
+        "placeholder rule must fire on a matching function"
+    );
+    assert_eq!(report.findings[0].rule_id, "{rule_id}");
+}}
+
+/// A function whose name does **not** contain the trigger word must produce
+/// zero findings.
+#[test]
+fn rule_silent_on_normal_function() {{
+    let scans = vec![FnScan {{
+        fn_name: "balance_of".to_string(),
+        require_auth: 0,
+        invoke_contract: 0,
+        bound: Default::default(),
+        usage: Default::default(),
+        division_before_multiplication: false,
+        external_call_before_state_write: false,
+        state_writes: 0,
+        is_entrypoint: true,
+        returns_value: false,
+    }}];
+    let ctx = AuditContext {{ spec: None }};
+    let mut report = AuditReport::default();
+    {struct_name}.check(&scans, &ctx, &mut report);
+    assert!(report.is_clean());
+}}
+"#,
+        lib_name = lib_name,
+        struct_name = struct_name,
+        rule_id = rule_id,
+        trigger = trigger,
+    );
+    write_template(root, "tests/rule_test.rs", &rule_test, &mut created)?;
 
     write_template(root, ".gitignore", "/target\n/.sdkt\n/plugin/*.so\n/plugin/*.dylib\n/plugin/*.dll\n/plugin/*.wasm\n/plugin-wasm/*.wasm\n*.sdktplugin\n", &mut created)?;
 
@@ -886,6 +944,7 @@ fn write_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DevKitConfig;
     use std::path::PathBuf;
 
     fn tmp_dir(name: &str) -> PathBuf {
@@ -913,6 +972,25 @@ mod tests {
         assert!(p.join(".gitignore").exists());
         assert!(p.join("tests/basic.rs").exists());
         assert_eq!(res.files_created.len(), 6);
+        let config = DevKitConfig::from_file(p.join(".sdkt.toml")).unwrap();
+        assert_eq!(
+            config.network.rpc_url,
+            "https://soroban-testnet.stellar.org"
+        );
+        assert_eq!(
+            config.network.passphrase,
+            "Test SDF Network ; September 2015"
+        );
+        let readme = fs::read_to_string(p.join("README.md")).unwrap();
+        assert!(readme.contains("## Deploy to Testnet"));
+        assert!(readme.contains("sdkt identity generate my-dev"));
+        assert!(readme
+            .contains("sdkt network add testnet --rpc-url https://soroban-testnet.stellar.org"));
+        assert!(readme.contains("sdkt invoke <CONTRACT_ID> hello"));
+        assert_eq!(
+            config.contracts.get("main").map(|c| c.path.as_str()),
+            Some(".")
+        );
         let _ = fs::remove_dir_all(&p);
     }
 
@@ -958,6 +1036,80 @@ mod tests {
         let content = fs::read_to_string(p.join("Cargo.toml")).unwrap();
         assert!(content.contains("[profile.release]"));
         assert!(content.contains("panic = \"abort\""));
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// Protocol 28: the generated manifest must target `soroban-sdk` 28.x and
+    /// therefore route through the canonical `stellar contract build` path that
+    /// `sdkt build` selects for v28 contracts. The README must also point at the
+    /// real artifact directory (`wasm32v1-none`), not the legacy
+    /// `wasm32-unknown-unknown`.
+    #[test]
+    fn scaffold_targets_protocol_28_and_routes_to_canonical_build() {
+        let p = tmp_dir("protocol28");
+        generate_project(&cfg(&p, false, false)).unwrap();
+        let cargo = fs::read_to_string(p.join("Cargo.toml")).unwrap();
+
+        assert!(
+            cargo.contains(&format!(
+                "soroban-sdk = \"={SCAFFOLD_SOROBAN_SDK_VERSION}\""
+            )),
+            "{cargo}"
+        );
+        assert_eq!(
+            SCAFFOLD_SOROBAN_SDK_VERSION.split('.').next(),
+            Some("28"),
+            "generated projects must target Protocol 28"
+        );
+
+        // The generated manifest is what `sdkt build` reads to pick a build
+        // system: a >= 28 requirement must select the canonical v28 path.
+        assert!(
+            crate::build::requires_v28_build_system(&p),
+            "generated project must require the Protocol 28 build path"
+        );
+
+        let readme = fs::read_to_string(p.join("README.md")).unwrap();
+        assert!(
+            readme.contains("target/wasm32v1-none/release/"),
+            "README must point at the real artifact dir: {readme}"
+        );
+        assert!(
+            !readme.contains("wasm32-unknown-unknown"),
+            "README must not reference the legacy wasm target: {readme}"
+        );
+
+        let _ = fs::remove_dir_all(&p);
+    }
+
+    /// #111: the generated manifest must pin the verified soroban-sdk exactly
+    /// (a caret requirement floats onto a `soroban-env-host` whose open
+    /// `ed25519-dalek` range breaks `cargo test`), and build a `lib` so the
+    /// generated integration test can link the crate.
+    #[test]
+    fn cargo_toml_pins_verified_sdk_and_links_for_tests() {
+        let p = tmp_dir("sdkpin");
+        generate_project(&cfg(&p, false, false)).unwrap();
+        let cargo = fs::read_to_string(p.join("Cargo.toml")).unwrap();
+        let pinned = format!("soroban-sdk = \"={SCAFFOLD_SOROBAN_SDK_VERSION}\"");
+        let dev_pinned = format!(
+            "soroban-sdk = {{ version = \"={SCAFFOLD_SOROBAN_SDK_VERSION}\", features = [\"testutils\"] }}"
+        );
+        assert!(cargo.contains(&pinned), "{cargo}");
+        assert!(cargo.contains(&dev_pinned), "{cargo}");
+        assert!(
+            cargo.contains("crate-type = [\"lib\", \"cdylib\"]"),
+            "{cargo}"
+        );
+        let rust = format!("rust-version = \"{SCAFFOLD_RUST_VERSION}\"");
+        assert!(cargo.contains(&rust), "{cargo}");
+
+        let test = fs::read_to_string(p.join("tests/basic.rs")).unwrap();
+        assert!(test.contains("env.register(Contract, ())"), "{test}");
+        assert!(
+            !test.contains("register_contract"),
+            "deprecated since soroban-sdk 22"
+        );
         let _ = fs::remove_dir_all(&p);
     }
 

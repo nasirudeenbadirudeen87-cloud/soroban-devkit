@@ -24,6 +24,7 @@
 //! ```
 
 pub mod builder;
+pub mod envelope;
 pub mod sign;
 pub mod typed;
 pub use builder::{
@@ -31,18 +32,20 @@ pub use builder::{
     build_create_contract_tx_with_data_and_auth, build_create_contract_v2_tx,
     build_create_contract_v2_tx_with_data, build_create_contract_v2_tx_with_data_and_auth,
     build_extend_footprint_tx, build_extend_footprint_tx_with_data, build_invoke_transaction,
-    build_invoke_transaction_with_data, build_upload_wasm_tx, build_upload_wasm_tx_with_data,
-    decode_account_id, decode_contract_id, decode_ledger_key, derive_contract_id,
-    merge_footprint_keys, parse_scval_args, parse_soroban_transaction_data, CreateContractParams,
-    CreateContractV2Params, ExtendFootprintParams, InvokeTransactionParams, UploadWasmParams,
+    build_invoke_transaction_with_data, build_restore_footprint_tx, build_upload_wasm_tx,
+    build_upload_wasm_tx_with_data, decode_account_id, decode_contract_id, decode_ledger_key,
+    derive_contract_id, memo_id, memo_text, merge_footprint_keys, parse_scval_args,
+    parse_soroban_transaction_data, CreateContractParams, CreateContractV2Params,
+    ExtendFootprintParams, InvokeTransactionParams, RestoreFootprintParams, UploadWasmParams,
 };
+pub use envelope::{decode_envelope, render_scval, view_envelope, EnvelopeView};
 pub use sign::{
     sign_envelope_with, sign_transaction, verify_signature, Ed25519Signer, Network, Signer,
     SigningError, SigningOptions,
 };
 pub use typed::{
-    decode_scvals, decode_scvals_ref, encode_scvals, scval_from_base64, scval_to_base64, Address,
-    FromScVal, IntoScVal, ScValError,
+    decode_scvals, decode_scvals_ref, encode_scvals, json_args_to_base64, json_to_scval,
+    scval_from_base64, scval_to_base64, Address, FromScVal, IntoScVal, ScValError,
 };
 
 use base64::engine::general_purpose::STANDARD;
@@ -115,17 +118,12 @@ fn parse_contract_id_bytes(contract: &str) -> Result<[u8; 32], DecodeError> {
     Ok(id)
 }
 
-/// Build a Soroban "enum/map"-style storage key `ScVal`: an `ScVec` whose first
-/// element is `symbol` and whose remaining elements are the decoded typed key
-/// arguments (each supplied as a Base64 `ScVal`).
+/// Build a validated `ScVal::Symbol`.
 ///
-/// This mirrors how the Soroban SDK encodes `DataKey`-style enum keys, e.g.
-/// `DataKey::Balance(addr)` → `ScVec[symbol("Balance"), address]`, so it also
-/// covers the single-symbol case (`ScVec[symbol("...")]`) when no args are given.
-pub fn build_map_key(symbol: &str, arg_scvals_b64: &[String]) -> Result<ScVal, DecodeError> {
-    // Soroban `Symbol`s are restricted to <=32 chars of [a-zA-Z0-9_]. `ScSymbol`
-    // itself only enforces the length bound, so validate the charset here — an
-    // out-of-charset symbol would silently build a key no contract ever writes.
+/// Soroban `Symbol`s are restricted to <=32 chars of [a-zA-Z0-9_]. `ScSymbol`
+/// itself only enforces the length bound, so validate the charset here — an
+/// out-of-charset symbol would silently build a value no contract ever emits.
+pub fn symbol_scval(symbol: &str) -> Result<ScVal, DecodeError> {
     if symbol.is_empty()
         || symbol.len() > 32
         || !symbol
@@ -141,8 +139,26 @@ pub fn build_map_key(symbol: &str, arg_scvals_b64: &[String]) -> Result<ScVal, D
             "invalid symbol {symbol:?}: must be <=32 chars of [a-zA-Z0-9_]"
         ))
     })?;
+    Ok(ScVal::Symbol(sym))
+}
+
+/// Encode an event-name symbol as the base64 XDR `ScVal` the RPC `getEvents`
+/// topic matcher compares against (e.g. `topic[0]` of a contract event).
+pub fn symbol_topic_base64(symbol: &str) -> Result<String, DecodeError> {
+    scval_to_base64(&symbol_scval(symbol)?)
+        .map_err(|e| DecodeError::Extraction(format!("failed to encode symbol {symbol:?}: {e}")))
+}
+
+/// Build a Soroban "enum/map"-style storage key `ScVal`: an `ScVec` whose first
+/// element is `symbol` and whose remaining elements are the decoded typed key
+/// arguments (each supplied as a Base64 `ScVal`).
+///
+/// This mirrors how the Soroban SDK encodes `DataKey`-style enum keys, e.g.
+/// `DataKey::Balance(addr)` → `ScVec[symbol("Balance"), address]`, so it also
+/// covers the single-symbol case (`ScVec[symbol("...")]`) when no args are given.
+pub fn build_map_key(symbol: &str, arg_scvals_b64: &[String]) -> Result<ScVal, DecodeError> {
     let mut elems: Vec<ScVal> = Vec::with_capacity(1 + arg_scvals_b64.len());
-    elems.push(ScVal::Symbol(sym));
+    elems.push(symbol_scval(symbol)?);
     for b64 in arg_scvals_b64 {
         let scval = scval_from_base64(b64).ok_or_else(|| {
             DecodeError::Extraction(format!("invalid Base64 ScVal key argument: {b64}"))
@@ -219,7 +235,7 @@ pub fn encode_ledger_key(params: &LedgerKeyParams) -> Result<String, DecodeError
 /// is intentionally scoped to ContractData/Wasm extraction only — it does NOT replace
 /// stellar-xdr's generic `LedgerEntry` decoder used elsewhere.
 pub fn extract_wasm_hash(base64_ledger_entry: &str) -> Result<String, DecodeError> {
-    let raw = detect_and_decode(base64_ledger_entry)?;
+    let raw = detect_and_decode(base64_ledger_entry, true)?;
 
     // Fast path: standard stellar-xdr 28.0.0 layout.
     match extract_wasm_hash_standard(&raw) {
@@ -265,6 +281,152 @@ pub fn extract_wasm_hash_from_live_ledger_entry(raw: &[u8]) -> Result<String, De
     extract_hash_from_contract_data(cd)
 }
 
+/// A contract's executable as recorded in its `ContractInstance` ledger entry.
+///
+/// Protocol 28 (CAP-0085) widened the `ContractExecutable` union beyond an
+/// inline Wasm hash, so "the contract's code" is no longer always a single
+/// `Hash`. This mirrors the XDR union faithfully; callers that need the actual
+/// code resolve the referenced entry through the RPC layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContractExecutableRef {
+    /// `CONTRACT_EXECUTABLE_WASM`: the instance's own Wasm hash.
+    Wasm(Hash),
+    /// `CONTRACT_EXECUTABLE_STELLAR_ASSET`: a Stellar Asset Contract. This is
+    /// protocol-defined code with no Wasm artifact of its own — there is no hash
+    /// to report and nothing to download.
+    StellarAsset,
+    /// `CONTRACT_EXECUTABLE_EXTERNAL_REF` (CAP-0085): the instance holds no
+    /// code; it references an entry owned by another contract.
+    ExternalRef(ExternalExecutableRef),
+}
+
+/// The owner + tag pair of a CAP-85 `CONTRACT_EXECUTABLE_EXTERNAL_REF`.
+///
+/// Per CAP-0085 the referenced Wasm hash lives in a **persistent contract-data
+/// entry of `executable_owner`, keyed by `tag`**, with the value being the 32
+/// raw hash bytes. The owner contract is not invoked for the lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalExecutableRef {
+    /// Owner contract holding the executable entry (CAP-85 `executable_owner`).
+    pub owner: ScAddress,
+    /// The tag keying the owner's entry (CAP-85 `tag`, an `ScString`).
+    pub tag: String,
+}
+
+impl ContractExecutableRef {
+    /// Stable lowercase label (`wasm`, `stellar_asset`, `external_ref`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ContractExecutableRef::Wasm(_) => "wasm",
+            ContractExecutableRef::StellarAsset => "stellar_asset",
+            ContractExecutableRef::ExternalRef(_) => "external_ref",
+        }
+    }
+
+    /// The ledger key of the owner's executable entry, for resolution.
+    ///
+    /// CAP-0085 keys this entry with `SCV_EXECUTABLE_TAG` and stores it as
+    /// `Persistent` contract data (the host rejects the `Temporary` and
+    /// `Instance` durabilities for such entries).
+    pub fn executable_tag_key(&self) -> Option<&ExternalExecutableRef> {
+        match self {
+            ContractExecutableRef::ExternalRef(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// Decode a contract instance's executable out of a Base64 XDR `LedgerEntry`.
+///
+/// Accepts both wire layouts SDKT already tolerates (standard
+/// `lastModifiedLedgerSeq`-first, and the live data-first layout) and returns
+/// the union variant actually present. Non-`ContractInstance` payloads and
+/// undecodable data keep returning the existing [`DecodeError`] variants.
+pub fn extract_contract_executable(
+    base64_ledger_entry: &str,
+) -> Result<ContractExecutableRef, DecodeError> {
+    let raw = detect_and_decode(base64_ledger_entry, true)?;
+    match extract_executable_standard(&raw) {
+        Ok(exec) => Ok(exec),
+        Err(DecodeError::XdrParse(..)) => extract_executable_from_live_ledger_entry(&raw),
+        Err(e) => Err(e),
+    }
+}
+
+fn map_executable(executable: ContractExecutable) -> Result<ContractExecutableRef, DecodeError> {
+    Ok(match executable {
+        ContractExecutable::Wasm(h) => ContractExecutableRef::Wasm(h),
+        ContractExecutable::StellarAsset => ContractExecutableRef::StellarAsset,
+        ContractExecutable::ExternalRef(r) => {
+            ContractExecutableRef::ExternalRef(ExternalExecutableRef {
+                owner: r.executable_owner,
+                // `SCString` payload is not required to be valid UTF-8 (it is an
+                // opaque key); surface it losslessly rather than dropping bytes.
+                tag: String::from_utf8_lossy(r.tag.as_slice()).into_owned(),
+            })
+        }
+    })
+}
+
+fn executable_from_contract_data(
+    data: stellar_xdr::ContractDataEntry,
+) -> Result<ContractExecutableRef, DecodeError> {
+    let instance = match data.val {
+        ScVal::ContractInstance(i) => i,
+        _ => return Err(DecodeError::Extraction("Not a ContractInstance".into())),
+    };
+    map_executable(instance.executable)
+}
+
+fn extract_executable_standard(raw: &[u8]) -> Result<ContractExecutableRef, DecodeError> {
+    let mut cursor = std::io::Cursor::new(raw);
+    let mut l = Limited::new(&mut cursor, Limits::none());
+    let entry = LedgerEntry::read_xdr(&mut l)
+        .map_err(|e| DecodeError::XdrParse("LedgerEntry".to_string(), e))?;
+    let data = match entry.data {
+        LedgerEntryData::ContractData(d) => d,
+        _ => return Err(DecodeError::Extraction("Not a ContractData entry".into())),
+    };
+    executable_from_contract_data(data)
+}
+
+fn extract_executable_from_live_ledger_entry(
+    raw: &[u8],
+) -> Result<ContractExecutableRef, DecodeError> {
+    let mut cursor = std::io::Cursor::new(raw);
+    let mut l = Limited::new(&mut cursor, Limits::none());
+    let data = LedgerEntryData::read_xdr(&mut l)
+        .map_err(|e| DecodeError::XdrParse("LedgerEntryData(live)".to_string(), e))?;
+    let cd = match data {
+        LedgerEntryData::ContractData(d) => d,
+        _ => return Err(DecodeError::Extraction("Not a ContractData entry".into())),
+    };
+    executable_from_contract_data(cd)
+}
+
+/// Read the 32-byte Wasm hash stored in a CAP-85 executable-tag entry.
+///
+/// CAP-0085 constrains such an entry to a `Bytes` value holding the raw hash
+/// of an already-uploaded Wasm (the host rejects strings, integers, and any
+/// 32-byte value that is not a live Wasm hash). Anything else is rejected here
+/// rather than coerced.
+pub fn parse_external_executable_hash(value: &ScVal) -> Result<String, DecodeError> {
+    let ScVal::Bytes(bytes) = value else {
+        return Err(DecodeError::Extraction(format!(
+            "CAP-85 executable tag entry holds {}, expected a 32-byte Bytes Wasm hash",
+            value.name()
+        )));
+    };
+    let slice = bytes.as_slice();
+    if slice.len() != 32 {
+        return Err(DecodeError::Extraction(format!(
+            "CAP-85 executable tag entry holds {} bytes, expected 32",
+            slice.len()
+        )));
+    }
+    Ok(hex::encode(slice))
+}
+
 /// Shared tail of both decoders: ContractData -> ContractInstance -> Wasm hash.
 fn extract_hash_from_contract_data(
     data: stellar_xdr::ContractDataEntry,
@@ -289,7 +451,7 @@ fn extract_hash_from_contract_data(
 pub fn extract_contract_data_value(
     base64_ledger_entry: &str,
 ) -> Result<stellar_xdr::ContractDataEntry, DecodeError> {
-    let raw = detect_and_decode(base64_ledger_entry)?;
+    let raw = detect_and_decode(base64_ledger_entry, true)?;
     match extract_contract_data_value_standard(&raw) {
         Ok(data) => Ok(data),
         Err(e) => match e {
@@ -330,7 +492,7 @@ fn extract_contract_data_value_from_live_ledger_entry(
 /// Same compatibility bridge as [`extract_wasm_hash`]: tries the standard
 /// stellar-xdr 28.0.0 layout first, then falls back to the live data-first wire layout.
 pub fn extract_wasm_bytecode(base64_ledger_entry: &str) -> Result<Vec<u8>, DecodeError> {
-    let raw = detect_and_decode(base64_ledger_entry)?;
+    let raw = detect_and_decode(base64_ledger_entry, true)?;
 
     match extract_wasm_bytecode_standard(&raw) {
         Ok(code) => Ok(code),
@@ -391,13 +553,73 @@ pub fn decode(
     type_hint: Option<&str>,
     format: OutputFormat,
 ) -> Result<String, DecodeError> {
-    let raw = detect_and_decode(payload)?;
-    let value = decode_bytes(&raw, type_hint)?;
-    format_json(&value, format)
+    decode_with_config(payload, type_hint, format, 500, true)
+}
+
+/// Decode with explicit config values (wired from `.sdkt.toml` `[decode]`).
+///
+/// `max_depth` bounds nested XDR parsing depth. `0` means **unlimited** — the
+/// XDR layer runs with `Limits::none` — and `DevKitConfig::validate` accepts
+/// `0` for exactly the same reason, so a `.sdkt.toml` that sets `0` and one
+/// that omits the section behave identically.
+/// `allow_fallback_hex` gates the hex fallback when base64 detection fails.
+pub fn decode_with_config(
+    payload: &str,
+    type_hint: Option<&str>,
+    format: OutputFormat,
+    max_depth: u32,
+    allow_fallback_hex: bool,
+) -> Result<String, DecodeError> {
+    let raw = detect_and_decode(payload, allow_fallback_hex)?;
+    match decode_bytes_with_config(&raw, type_hint, max_depth) {
+        Ok(v) => format_json(&v, format),
+        Err(primary) => {
+            // Issue #375: a hex-encoded payload whose characters are all valid
+            // base64-alphabet symbols (common for short ScVals) decodes as
+            // valid base64 into garbage bytes that then fail XDR parsing. When
+            // the hex fallback is enabled, retry the pure-hex interpretation
+            // before surfacing the error. When it is disabled, the original
+            // decode path is taken and behaviour is unchanged.
+            if allow_fallback_hex {
+                if let Some(hex_bytes) = hex_bytes_if_valid(payload) {
+                    if hex_bytes != raw {
+                        if let Ok(v) = decode_bytes_with_config(&hex_bytes, type_hint, max_depth) {
+                            return format_json(&v, format);
+                        }
+                    }
+                }
+            }
+            Err(primary)
+        }
+    }
+}
+
+/// Decodes `payload` as hexadecimal when it is non-empty, even-length, and
+/// every character is an ASCII hex digit. Returns `None` otherwise — this is
+/// a pure decoding helper with no opinion about XDR validity.
+fn hex_bytes_if_valid(payload: &str) -> Option<Vec<u8>> {
+    let trimmed = payload.trim();
+    if !trimmed.is_empty()
+        && trimmed.len().is_multiple_of(2)
+        && trimmed.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        hex::decode(trimmed).ok()
+    } else {
+        None
+    }
 }
 
 /// Decode raw bytes (no base64/hex pre-processing).
 pub fn decode_bytes(raw: &[u8], type_hint: Option<&str>) -> Result<Value, DecodeError> {
+    decode_bytes_with_config(raw, type_hint, 500)
+}
+
+/// Decode raw bytes with explicit max_depth.
+pub fn decode_bytes_with_config(
+    raw: &[u8],
+    type_hint: Option<&str>,
+    max_depth: u32,
+) -> Result<Value, DecodeError> {
     if raw.is_empty() {
         return Err(DecodeError::EmptyPayload);
     }
@@ -405,14 +627,18 @@ pub fn decode_bytes(raw: &[u8], type_hint: Option<&str>) -> Result<Value, Decode
     let type_name = type_hint.unwrap_or("auto");
 
     match type_name.to_lowercase().as_str() {
-        "scval" => decode_single::<ScVal>(raw, "ScVal"),
-        "transactionenvelope" => decode_single::<TransactionEnvelope>(raw, "TransactionEnvelope"),
-        "transactionresult" => decode_single::<TransactionResult>(raw, "TransactionResult"),
-        "transactionmeta" => decode_single::<TransactionMeta>(raw, "TransactionMeta"),
-        "ledgerkey" => decode_single::<LedgerKey>(raw, "LedgerKey"),
-        "ledgerentry" => decode_single::<LedgerEntry>(raw, "LedgerEntry"),
-        "contractevent" => decode_single::<ContractEvent>(raw, "ContractEvent"),
-        "auto" => auto_detect(raw),
+        "scval" => decode_single::<ScVal>(raw, "ScVal", max_depth),
+        "transactionenvelope" => {
+            decode_single::<TransactionEnvelope>(raw, "TransactionEnvelope", max_depth)
+        }
+        "transactionresult" => {
+            decode_single::<TransactionResult>(raw, "TransactionResult", max_depth)
+        }
+        "transactionmeta" => decode_single::<TransactionMeta>(raw, "TransactionMeta", max_depth),
+        "ledgerkey" => decode_single::<LedgerKey>(raw, "LedgerKey", max_depth),
+        "ledgerentry" => decode_single::<LedgerEntry>(raw, "LedgerEntry", max_depth),
+        "contractevent" => decode_single::<ContractEvent>(raw, "ContractEvent", max_depth),
+        "auto" => auto_detect(raw, max_depth),
         other => Err(DecodeError::TypeUnknown(other.to_string())),
     }
 }
@@ -420,22 +646,56 @@ pub fn decode_bytes(raw: &[u8], type_hint: Option<&str>) -> Result<Value, Decode
 fn decode_single<T: ReadXdr + serde::Serialize>(
     raw: &[u8],
     name: &str,
+    max_depth: u32,
 ) -> Result<Value, DecodeError> {
     let mut cursor = std::io::Cursor::new(raw);
-    let mut l = Limited::new(&mut cursor, Limits::none());
+    let limits = if max_depth == 0 {
+        Limits::none()
+    } else {
+        Limits {
+            depth: max_depth,
+            len: raw.len(),
+        }
+    };
+    let mut l = Limited::new(&mut cursor, limits);
     T::read_xdr(&mut l)
         .map_err(|e| DecodeError::XdrParse(name.to_string(), e))
         .and_then(|v| serde_json::to_value(&v).map_err(DecodeError::Json))
 }
 
-fn auto_detect(raw: &[u8]) -> Result<Value, DecodeError> {
-    if let Ok(v) = decode_single::<ScVal>(raw, "ScVal") {
+fn decode_single_strict<T: ReadXdr + serde::Serialize>(
+    raw: &[u8],
+    name: &str,
+    max_depth: u32,
+) -> Result<Value, DecodeError> {
+    let mut cursor = std::io::Cursor::new(raw);
+    let limits = if max_depth == 0 {
+        Limits::none()
+    } else {
+        Limits {
+            depth: max_depth,
+            len: raw.len(),
+        }
+    };
+    let mut l = Limited::new(&mut cursor, limits);
+    T::read_xdr_to_end(&mut l)
+        .map_err(|e| DecodeError::XdrParse(name.to_string(), e))
+        .and_then(|v| serde_json::to_value(&v).map_err(DecodeError::Json))
+}
+
+fn auto_detect(raw: &[u8], max_depth: u32) -> Result<Value, DecodeError> {
+    if let Ok(v) = decode_single_strict::<ScVal>(raw, "ScVal", max_depth) {
         return Ok(v);
     }
-    if let Ok(v) = decode_single::<TransactionEnvelope>(raw, "TransactionEnvelope") {
+    if let Ok(v) =
+        decode_single_strict::<TransactionEnvelope>(raw, "TransactionEnvelope", max_depth)
+    {
         return Ok(v);
     }
-    if let Ok(v) = decode_single::<ContractEvent>(raw, "ContractEvent") {
+    if let Ok(v) = decode_single_strict::<ContractEvent>(raw, "ContractEvent", max_depth) {
+        return Ok(v);
+    }
+    if let Ok(v) = decode_single_strict::<TransactionResult>(raw, "TransactionResult", max_depth) {
         return Ok(v);
     }
     Err(DecodeError::TypeUnknown(
@@ -443,7 +703,7 @@ fn auto_detect(raw: &[u8]) -> Result<Value, DecodeError> {
     ))
 }
 
-fn detect_and_decode(payload: &str) -> Result<Vec<u8>, DecodeError> {
+fn detect_and_decode(payload: &str, allow_fallback_hex: bool) -> Result<Vec<u8>, DecodeError> {
     if payload.is_empty() {
         return Err(DecodeError::EmptyPayload);
     }
@@ -462,7 +722,10 @@ fn detect_and_decode(payload: &str) -> Result<Vec<u8>, DecodeError> {
         }
     }
 
-    if trimmed.len().is_multiple_of(2) && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+    if allow_fallback_hex
+        && trimmed.len().is_multiple_of(2)
+        && trimmed.chars().all(|c| c.is_ascii_hexdigit())
+    {
         if let Ok(bytes) = hex::decode(trimmed) {
             return Ok(bytes);
         }
@@ -522,7 +785,7 @@ mod tests {
     use stellar_xdr::{
         ContractDataDurability, ContractDataEntry, ContractExecutable, ExtensionPoint, Hash,
         LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, ScAddress, ScContractInstance,
-        ScVal, WriteXdr,
+        ScVal, TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
     };
 
     #[test]
@@ -554,6 +817,48 @@ mod tests {
         let v: Value = serde_json::from_str(&json).unwrap();
         assert!(v.is_object());
         assert_eq!(v["i32"], 1);
+    }
+
+    #[test]
+    fn test_auto_decode_transaction_result() {
+        let fee_charged = 9_000_000_000_000_i64;
+        let result = TransactionResult {
+            fee_charged,
+            result: TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
+            ext: TransactionResultExt::V0,
+        };
+        let bytes = result.to_xdr(Limits::none()).unwrap();
+        let payload = STANDARD.encode(bytes);
+        let json = decode(&payload, None, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["fee_charged"], fee_charged.to_string());
+        assert!(v["result"]["tx_success"].is_array());
+    }
+
+    #[test]
+    fn test_auto_decode_small_transaction_result_not_scval() {
+        let fee_charged = 100_i64;
+        let result = TransactionResult {
+            fee_charged,
+            result: TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
+            ext: TransactionResultExt::V0,
+        };
+        let bytes = result.to_xdr(Limits::none()).unwrap();
+        let payload = STANDARD.encode(bytes);
+        let json = decode(&payload, None, OutputFormat::Json).unwrap();
+        let v: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["fee_charged"], fee_charged.to_string());
+        assert!(v["result"]["tx_success"].is_array());
+        assert!(v.get("i32").is_none());
+    }
+
+    #[test]
+    fn test_auto_decode_unknown_payload_still_returns_type_unknown() {
+        let payload = "aGVsbG8gd29ybGQ=";
+        let result = decode(payload, None, OutputFormat::default());
+        assert!(matches!(result, Err(DecodeError::TypeUnknown(_))));
     }
 
     #[test]
@@ -590,6 +895,34 @@ mod tests {
             }
             other => panic!("expected ScVec, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_symbol_topic_base64_encodes_scval_symbol() {
+        // SCV_SYMBOL (15) + length 8 + "Transfer" (already 4-byte aligned).
+        let b64 = symbol_topic_base64("Transfer").unwrap();
+        assert_eq!(b64, "AAAADwAAAAhUcmFuc2Zlcg==");
+        assert_eq!(
+            scval_from_base64(&b64),
+            Some(ScVal::Symbol("Transfer".try_into().unwrap()))
+        );
+        // Symbols are case-sensitive on the wire.
+        assert_eq!(
+            symbol_topic_base64("transfer").unwrap(),
+            "AAAADwAAAAh0cmFuc2Zlcg=="
+        );
+    }
+
+    #[test]
+    fn test_symbol_topic_base64_rejects_invalid_symbols() {
+        for bad in ["", "has space", "dash-ed", "é", &"a".repeat(33)] {
+            let err = symbol_topic_base64(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid symbol"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+        assert!(symbol_topic_base64(&"a".repeat(32)).is_ok());
     }
 
     #[test]
@@ -664,6 +997,125 @@ mod tests {
         assert_eq!(from_hex, from_strkey);
     }
 
+    // ---- CAP-85 (Protocol 28) executable variants ----
+    //
+    // `ContractExecutable` is a Protocol 28 XDR union. These fixtures are built
+    // with the real `stellar-xdr` types and round-tripped through the same
+    // decoders the RPC inspection path uses, so they exercise the wire
+    // representation rather than a hand-written enum value.
+
+    /// Owner address used by the external-ref fixtures.
+    fn external_ref_fixture() -> (ContractExecutable, ScAddress) {
+        let owner = ScAddress::Contract(ContractId(Hash([7u8; 32])));
+        let tag =
+            stellar_xdr::ScString(stellar_xdr::StringM::try_from(b"oracle-v1".to_vec()).unwrap());
+        (
+            ContractExecutable::ExternalRef(stellar_xdr::ContractExecutableExternalRef {
+                executable_owner: owner.clone(),
+                tag,
+            }),
+            owner,
+        )
+    }
+
+    #[test]
+    fn test_extract_contract_executable_wasm() {
+        let hash = [9u8; 32];
+        let b64 = create_test_ledger_entry(ContractExecutable::Wasm(Hash(hash)));
+        let exec = extract_contract_executable(&b64).unwrap();
+        assert_eq!(exec.kind(), "wasm");
+        assert_eq!(exec, ContractExecutableRef::Wasm(Hash(hash)));
+        // The pre-existing Wasm-only extraction must keep reporting the same hash.
+        assert_eq!(extract_wasm_hash(&b64).unwrap(), hex::encode(hash));
+    }
+
+    #[test]
+    fn test_extract_contract_executable_stellar_asset_is_not_wasm() {
+        let b64 = create_test_ledger_entry(ContractExecutable::StellarAsset);
+        let exec = extract_contract_executable(&b64).unwrap();
+        assert_eq!(exec, ContractExecutableRef::StellarAsset);
+        assert_eq!(exec.kind(), "stellar_asset");
+        // A SAC must never be reported as a Wasm contract.
+        assert!(!matches!(exec, ContractExecutableRef::Wasm(_)));
+        assert!(exec.executable_tag_key().is_none());
+    }
+
+    #[test]
+    fn test_extract_contract_executable_external_ref() {
+        let (executable, owner) = external_ref_fixture();
+        let b64 = create_test_ledger_entry(executable);
+        let exec = extract_contract_executable(&b64).unwrap();
+        assert_eq!(exec.kind(), "external_ref");
+        let reference = exec.executable_tag_key().expect("external ref key");
+        assert_eq!(reference.owner, owner);
+        assert_eq!(reference.tag, "oracle-v1");
+        // An external ref has no inline hash: the legacy Wasm-only extractor must
+        // keep failing loudly rather than inventing one.
+        assert!(extract_wasm_hash(&b64).is_err());
+    }
+
+    #[test]
+    fn test_external_ref_survives_live_wire_layout() {
+        // The live RPC wire layout serialises `LedgerEntryData` first (with the
+        // remaining `LedgerEntry` fields trailing) — the layout the compatibility
+        // bridge exists for. Build exactly that: `LedgerEntryData` only.
+        let (executable, owner) = external_ref_fixture();
+        let data = LedgerEntryData::ContractData(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: ScAddress::Contract(ContractId(Hash([0; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::ContractInstance(ScContractInstance {
+                executable,
+                storage: None,
+            }),
+        });
+        let mut buf = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut buf);
+        let mut l = Limited::new(&mut cursor, Limits::none());
+        data.write_xdr(&mut l).unwrap();
+
+        let exec = extract_executable_from_live_ledger_entry(&buf).unwrap();
+        assert_eq!(exec.kind(), "external_ref");
+        assert_eq!(exec.executable_tag_key().unwrap().owner, owner);
+        assert_eq!(exec.executable_tag_key().unwrap().tag, "oracle-v1");
+    }
+
+    #[test]
+    fn test_parse_external_executable_hash_accepts_32_bytes() {
+        let hash = [3u8; 32];
+        let val = ScVal::Bytes(stellar_xdr::ScBytes(
+            stellar_xdr::BytesM::try_from(hash.to_vec()).unwrap(),
+        ));
+        assert_eq!(
+            parse_external_executable_hash(&val).unwrap(),
+            hex::encode(hash)
+        );
+    }
+
+    #[test]
+    fn test_parse_external_executable_hash_rejects_non_hash_values() {
+        // CAP-0085 constrains the entry to raw 32-byte hash bytes; the host
+        // rejects these shapes, and so must we (no silent coercion).
+        let short = ScVal::Bytes(stellar_xdr::ScBytes(
+            stellar_xdr::BytesM::try_from(vec![1u8; 31]).unwrap(),
+        ));
+        assert!(parse_external_executable_hash(&short).is_err());
+
+        let as_string = ScVal::String(stellar_xdr::ScString(
+            stellar_xdr::StringM::try_from(vec![1u8; 32]).unwrap(),
+        ));
+        assert!(parse_external_executable_hash(&as_string).is_err());
+
+        assert!(parse_external_executable_hash(&ScVal::U32(5)).is_err());
+    }
+
+    #[test]
+    fn test_extract_contract_executable_rejects_non_contract_data() {
+        let err = extract_contract_executable("AAAABAAAAAE=").unwrap_err();
+        assert!(matches!(err, DecodeError::XdrParse(_, _)));
+    }
+
     #[test]
     fn test_build_map_key_rejects_invalid_symbol_and_arg() {
         assert!(build_map_key("has spaces", &[]).is_err());
@@ -686,7 +1138,7 @@ mod tests {
         let res =
             encode_ledger_key(&LedgerKeyParams::ContractData(contract_id.to_string())).unwrap();
         // Decode it back to verify it's a LedgerKey::ContractData with ScVal::LedgerKeyContractInstance
-        let decoded = detect_and_decode(&res).unwrap();
+        let decoded = detect_and_decode(&res, true).unwrap();
         let mut cursor = std::io::Cursor::new(&decoded);
         let mut l = Limited::new(&mut cursor, Limits::none());
         let lk = LedgerKey::read_xdr(&mut l).unwrap();
@@ -772,7 +1224,7 @@ mod tests {
     fn test_extract_wasm_hash_live_wasm_wire_layout() {
         // The live entry must NOT decode via the standard (lastModifiedLedgerSeq-first)
         // path, proving the captured wire layout genuinely differs.
-        let raw = detect_and_decode(LIVE_WASM_LEDGER_ENTRY_B64).unwrap();
+        let raw = detect_and_decode(LIVE_WASM_LEDGER_ENTRY_B64, true).unwrap();
         assert!(extract_wasm_hash_standard(&raw).is_err());
 
         // The compatibility bridge decodes it and extracts the correct Wasm hash.
@@ -791,7 +1243,7 @@ mod tests {
     fn test_extract_wasm_hash_live_sac_is_controlled_error() {
         // A live SAC (StellarAsset executable) decodes structurally but yields a
         // controlled `Extraction` error — never an XDR panic or a wrong hash.
-        let raw = detect_and_decode(LIVE_SAC_LEDGER_ENTRY_B64).unwrap();
+        let raw = detect_and_decode(LIVE_SAC_LEDGER_ENTRY_B64, true).unwrap();
         let err = extract_wasm_hash_from_live_ledger_entry(&raw).unwrap_err();
         assert!(matches!(err, DecodeError::Extraction(e) if e.contains("Not a Wasm")));
 
@@ -814,6 +1266,86 @@ mod tests {
         let val = ScVal::U32(42);
         // Tag(4) + U32(4) = 8 bytes
         assert_eq!(estimate_xdr_size(&val), 8);
+    }
+
+    #[test]
+    fn test_decode_with_config_max_depth_rejects_deeper_payload() {
+        // Issue #375: a configured max_depth must reject a deeper value.
+        // Build a nested ScVal: Vec[Vec[Vec[Vec[U32]]]] = depth 4.
+        let innermost = ScVal::U32(7);
+        let d4 = ScVal::Vec(Some(ScVec::try_from(vec![innermost]).unwrap()));
+        let d3 = ScVal::Vec(Some(ScVec::try_from(vec![d4]).unwrap()));
+        let d2 = ScVal::Vec(Some(ScVec::try_from(vec![d3]).unwrap()));
+        let deep = ScVal::Vec(Some(ScVec::try_from(vec![d2]).unwrap()));
+        let mut buf = Vec::new();
+        let mut l = Limited::new(&mut buf, Limits::none());
+        deep.write_xdr(&mut l).unwrap();
+        let b64 = STANDARD.encode(&buf);
+
+        // Depth 2 must reject; depth 0 (unlimited) must accept.
+        let shallow = decode_with_config(&b64, Some("scval"), OutputFormat::Json, 2, true);
+        assert!(
+            shallow.is_err(),
+            "max_depth = 2 must reject a depth-4 ScVal"
+        );
+        let unlimited = decode_with_config(&b64, Some("scval"), OutputFormat::Json, 0, true);
+        assert!(unlimited.is_ok(), "max_depth = 0 (unlimited) must accept");
+    }
+
+    #[test]
+    fn test_decode_with_config_allow_fallback_hex_gates_hex_input() {
+        // Issue #375: allow_fallback_hex = false must refuse a hex-only payload
+        // that base64 detection cannot decode.
+        let hex_payload = "deadbeef";
+        let denied = decode_with_config(hex_payload, Some("scval"), OutputFormat::Json, 500, false);
+        assert!(
+            denied.is_err(),
+            "allow_fallback_hex = false must reject hex input"
+        );
+        let allowed = decode_with_config(hex_payload, Some("scval"), OutputFormat::Json, 500, true);
+        // With fallback enabled the bytes decode (then fail XDR parsing, which
+        // proves the hex path ran — the error is not a decode error).
+        assert!(allowed.is_err(), "hex bytes are not a valid ScVal");
+        assert!(
+            !matches!(allowed.unwrap_err(), DecodeError::Hex(_)),
+            "fallback must have consumed the hex input"
+        );
+    }
+
+    #[test]
+    fn test_decode_with_config_hex_fallback_recovers_valid_scval() {
+        // Issue #375 regression: a valid ScVal hex string is also a valid
+        // base64 string (short ScVals are all base64-alphabet symbols), so the
+        // base64 candidate decodes into garbage that fails XDR parsing. With
+        // the fallback enabled the hex interpretation must be retried and the
+        // payload must decode successfully.
+        let val = ScVal::U32(42);
+        let mut buf = Vec::new();
+        let mut l = Limited::new(&mut buf, Limits::none());
+        val.write_xdr(&mut l).unwrap();
+        let hex_payload = hex::encode(&buf);
+        // Guard the premise: the payload really is base64-shaped.
+        assert!(
+            hex_payload.len().is_multiple_of(4),
+            "premise: hex ScVal must also be base64-shaped"
+        );
+
+        let decoded =
+            decode_with_config(&hex_payload, Some("scval"), OutputFormat::Json, 500, true)
+                .expect("hex fallback must recover a valid ScVal");
+        assert!(
+            decoded.contains("42"),
+            "decoded ScVal must carry the u32 value, got: {decoded}"
+        );
+
+        // Behaviour when the fallback is disabled is unchanged: the hex payload
+        // is not accepted as XDR.
+        let denied =
+            decode_with_config(&hex_payload, Some("scval"), OutputFormat::Json, 500, false);
+        assert!(
+            denied.is_err(),
+            "allow_fallback_hex = false must not recover the hex payload"
+        );
     }
 }
 

@@ -10,10 +10,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{parse_contract_spec, parse_metadata, ContractFunction, ContractSpec, WasmError};
+use crate::{
+    parse_contract_spec, parse_metadata, ContractEvent, ContractFunction, ContractSpec,
+    ContractType, WasmError,
+};
 
 /// The full comparison result between two contract WASM binaries.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+///
+/// `Eq` is not derived because `size_delta_pct` is an `Option<f64>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct SpecDiff {
     /// Metadata of the "old" (baseline) WASM.
     pub old: WasmSummary,
@@ -29,10 +34,25 @@ pub struct SpecDiff {
     pub added_events: Vec<String>,
     /// Events present in `old` but absent from `new`.
     pub removed_events: Vec<String>,
+    /// Events present in both whose signature (prefix topics, params, data
+    /// format) changed.
+    pub changed_events: Vec<EventSignatureChange>,
     /// Custom types present in `new` but absent from `old`.
     pub added_types: Vec<String>,
     /// Custom types present in `old` but absent from `new`.
     pub removed_types: Vec<String>,
+    /// Custom types present in both whose definition (kind or members) changed.
+    pub changed_types: Vec<TypeDefinitionChange>,
+    /// Signed size change: `new.size_bytes - old.size_bytes` (negative when the
+    /// candidate shrank). Always present; independent of any policy flag.
+    pub size_delta_bytes: i64,
+    /// Percentage growth relative to the old artifact, rounded to one decimal
+    /// place (e.g. `2157.6`). `null` when the old artifact is zero bytes and
+    /// the new one is not — a relative change against an empty baseline is
+    /// mathematically undefined, and is never coerced to 0 or infinity.
+    /// Both artifacts empty ⇒ `Some(0.0)`.
+    #[serde(default)]
+    pub size_delta_pct: Option<f64>,
 }
 
 /// Lightweight WASM identity summary for diff context.
@@ -52,6 +72,22 @@ pub struct FunctionSignatureChange {
     pub new: ContractFunction,
 }
 
+/// An event whose signature changed while keeping its name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventSignatureChange {
+    pub name: String,
+    pub old: ContractEvent,
+    pub new: ContractEvent,
+}
+
+/// A custom type whose definition changed while keeping its name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TypeDefinitionChange {
+    pub name: String,
+    pub old: ContractType,
+    pub new: ContractType,
+}
+
 impl SpecDiff {
     /// True when the two WASM binaries declare an identical ABI surface
     /// (same functions, signatures, events, and custom types).
@@ -61,8 +97,10 @@ impl SpecDiff {
             && self.changed_functions.is_empty()
             && self.added_events.is_empty()
             && self.removed_events.is_empty()
+            && self.changed_events.is_empty()
             && self.added_types.is_empty()
             && self.removed_types.is_empty()
+            && self.changed_types.is_empty()
     }
 
     /// Total number of breaking/non-breaking deltas (a single count used for
@@ -73,8 +111,10 @@ impl SpecDiff {
             + self.changed_functions.len()
             + self.added_events.len()
             + self.removed_events.len()
+            + self.changed_events.len()
             + self.added_types.len()
             + self.removed_types.len()
+            + self.changed_types.len()
     }
 }
 
@@ -119,6 +159,8 @@ pub fn diff_specs(
         new: new_summary,
         ..Default::default()
     };
+    diff.size_delta_bytes = size_delta_bytes(diff.old.size_bytes, diff.new.size_bytes);
+    diff.size_delta_pct = size_delta_pct(diff.old.size_bytes, diff.new.size_bytes);
 
     // Index old by name for O(n) lookups.
     let old_fns: std::collections::BTreeMap<&str, &ContractFunction> =
@@ -146,6 +188,12 @@ pub fn diff_specs(
         }
     }
 
+    // Events and custom types: name-set comparison for add/remove, then a
+    // definition comparison for the ones present on both sides. Comparing
+    // names alone would report an event/type that changed its shape in place
+    // as unchanged.
+    let old_events = by_name(&old.events, |e| e.name.as_str());
+    let new_events = by_name(&new.events, |e| e.name.as_str());
     diff_set(
         &old.events
             .iter()
@@ -158,6 +206,20 @@ pub fn diff_specs(
         &mut diff.added_events,
         &mut diff.removed_events,
     );
+    for (name, ne) in &new_events {
+        if let Some(oe) = old_events.get(name) {
+            if !event_signature_eq(oe, ne) {
+                diff.changed_events.push(EventSignatureChange {
+                    name: (*name).to_string(),
+                    old: (*oe).clone(),
+                    new: (**ne).clone(),
+                });
+            }
+        }
+    }
+
+    let old_types = by_name(&old.custom_types, |t| t.name.as_str());
+    let new_types = by_name(&new.custom_types, |t| t.name.as_str());
     diff_set(
         &old.custom_types
             .iter()
@@ -170,8 +232,82 @@ pub fn diff_specs(
         &mut diff.added_types,
         &mut diff.removed_types,
     );
+    for (name, nt) in &new_types {
+        if let Some(ot) = old_types.get(name) {
+            if !type_definition_eq(ot, nt) {
+                diff.changed_types.push(TypeDefinitionChange {
+                    name: (*name).to_string(),
+                    old: (*ot).clone(),
+                    new: (**nt).clone(),
+                });
+            }
+        }
+    }
 
     Ok(diff)
+}
+
+/// Index a list of named ABI entries by name for O(n) lookups.
+fn by_name<T, F>(items: &[T], name_of: F) -> std::collections::BTreeMap<&str, &T>
+where
+    F: Fn(&T) -> &str,
+{
+    items.iter().map(|i| (name_of(i), i)).collect()
+}
+
+/// Compare two [`ContractType`] references by identity, ignoring docs.
+///
+/// For compound types (`option<T>`, `vec<T>`, `map<K,V>`, `result<O,E>`,
+/// `tuple<...>`, `bytesn<N>`) the recursive inner structure is encoded into
+/// `name` (e.g. `"vec<u32>"` vs `"vec<i128>"`), so a name + kind comparison
+/// is sufficient to distinguish e.g. `Vec<u32>` from `Vec<i128>`. The members
+/// field is compared as well for defence-in-depth.
+fn type_ref_eq(a: &ContractType, b: &ContractType) -> bool {
+    if a.name != b.name || a.kind != b.kind {
+        return false;
+    }
+    // For compound types the `members` field carries the inner ContractTypes
+    // that were recursively mapped.  Comparing them here ensures that nested
+    // compound structures (e.g. Option<Vec<u32>>) are compared deeply even
+    // if, hypothetically, the name encoding were ever changed.
+    if a.kind == "compound" {
+        return a.members.len() == b.members.len()
+            && a.members
+                .iter()
+                .zip(b.members.iter())
+                .all(|(x, y)| x.name == y.name && member_types_eq(&x.types, &y.types));
+    }
+    true
+}
+
+/// Compare two member type lists by identity (name + kind), ignoring docs.
+fn member_types_eq(a: &[ContractType], b: &[ContractType]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| type_ref_eq(x, y))
+}
+
+/// Compare two event signatures, ignoring doc comments (docs are not ABI).
+///
+/// A consumer decodes the topic/data payload layout, so any change to the
+/// prefix topics, the parameter list (name, type, or topic-vs-data location),
+/// or the data format is a signature change.
+fn event_signature_eq(a: &ContractEvent, b: &ContractEvent) -> bool {
+    a.prefix_topics == b.prefix_topics
+        && a.data_format == b.data_format
+        && a.params.len() == b.params.len()
+        && a.params.iter().zip(b.params.iter()).all(|(x, y)| {
+            x.name == y.name && x.location == y.location && type_ref_eq(&x.type_, &y.type_)
+        })
+}
+
+/// Compare two custom type definitions, ignoring doc comments (docs are not
+/// ABI). A change of kind (struct -> enum), of any member's name or types, or
+/// of an enum case's discriminant is a definition change.
+fn type_definition_eq(a: &ContractType, b: &ContractType) -> bool {
+    a.kind == b.kind
+        && a.members.len() == b.members.len()
+        && a.members.iter().zip(b.members.iter()).all(|(x, y)| {
+            x.name == y.name && x.value == y.value && member_types_eq(&x.types, &y.types)
+        })
 }
 
 /// Classify named items present in `new` but not `old` (`added`) and `old` but
@@ -203,6 +339,8 @@ pub enum ChangeKind {
     AddedFunction,
     AddedEvent,
     AddedType,
+    ChangedEvent,
+    ChangedTypeDefinition,
 }
 
 /// A single classified delta, used for both breaking and non-breaking lists.
@@ -228,6 +366,8 @@ impl VerdictChange {
             ChangeKind::AddedFunction => "Added function",
             ChangeKind::AddedEvent => "Added event",
             ChangeKind::AddedType => "Added type",
+            ChangeKind::ChangedEvent => "Changed event",
+            ChangeKind::ChangedTypeDefinition => "Changed type definition",
         };
         match self.kind {
             ChangeKind::RemovedFunction
@@ -243,8 +383,9 @@ impl VerdictChange {
 /// An actionable upgrade-safety verdict derived from a [`SpecDiff`].
 ///
 /// `compatible` is `false` when any *breaking* change is present (removed
-/// function, changed signature, removed event, removed type). Additions are
-/// non-breaking and recorded separately.
+/// function, changed signature, removed event, changed event signature,
+/// removed type, changed type definition). Additions are non-breaking and
+/// recorded separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct UpgradeVerdict {
     pub compatible: bool,
@@ -282,11 +423,29 @@ impl UpgradeVerdict {
                 detail: String::new(),
             });
         }
+        for c in &diff.changed_events {
+            breaking.push(VerdictChange {
+                kind: ChangeKind::ChangedEvent,
+                name: c.name.clone(),
+                detail: format!(
+                    "old: {}\n      new: {}",
+                    event_sig(&c.old),
+                    event_sig(&c.new)
+                ),
+            });
+        }
         for t in &diff.removed_types {
             breaking.push(VerdictChange {
                 kind: ChangeKind::RemovedType,
                 name: t.clone(),
                 detail: String::new(),
+            });
+        }
+        for c in &diff.changed_types {
+            breaking.push(VerdictChange {
+                kind: ChangeKind::ChangedTypeDefinition,
+                name: c.name.clone(),
+                detail: format!("old: {}\n      new: {}", type_sig(&c.old), type_sig(&c.new)),
             });
         }
         for f in &diff.added_functions {
@@ -320,6 +479,26 @@ impl UpgradeVerdict {
     }
 }
 
+/// Signed size delta in bytes between two artifacts.
+pub fn size_delta_bytes(old_bytes: usize, new_bytes: usize) -> i64 {
+    new_bytes as i64 - old_bytes as i64
+}
+
+/// Percentage growth of `new_bytes` relative to `old_bytes`, rounded to one
+/// decimal place.
+///
+/// Zero-byte baseline semantics (documented, no division by zero):
+/// - old == 0, new == 0 → `Some(0.0)` (nothing grew);
+/// - old == 0, new  > 0 → `None` — undefined relative change (rendered as
+///   `null` in JSON); absolute policy (`--max-size-bytes`) still applies.
+pub fn size_delta_pct(old_bytes: usize, new_bytes: usize) -> Option<f64> {
+    if old_bytes == 0 {
+        return if new_bytes == 0 { Some(0.0) } else { None };
+    }
+    let pct = (new_bytes as f64 - old_bytes as f64) * 100.0 / old_bytes as f64;
+    Some((pct * 10.0).round() / 10.0)
+}
+
 /// Build a `name(params) -> outputs` signature string for a function.
 fn sig_of(f: &ContractFunction) -> String {
     let params = f
@@ -335,6 +514,57 @@ fn sig_of(f: &ContractFunction) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{}({}) -> ({})", f.name, params, outputs)
+}
+
+/// Build a `name(param: type, ...)` signature string for an event, annotating
+/// each parameter with whether it is carried in a topic or in the data
+/// payload — the two are decoded differently by consumers.
+pub fn event_sig(e: &ContractEvent) -> String {
+    let mut parts: Vec<String> = e
+        .prefix_topics
+        .iter()
+        .map(|t| format!("{}: symbol [prefix]", t))
+        .collect();
+    parts.extend(
+        e.params
+            .iter()
+            .map(|p| format!("{}: {} [{}]", p.name, p.type_.name, p.location)),
+    );
+    format!("{}({}) -> {}", e.name, parts.join(", "), e.data_format)
+}
+
+/// Build a `kind name { member, ... }` definition string for a custom type.
+///
+/// An enum or error-enum case renders as `Name=0`, showing the discriminant
+/// that decodes the case; a struct field or union case renders as
+/// `name: type` (or `name: void` for a void union case).
+pub fn type_sig(t: &ContractType) -> String {
+    let members = t
+        .members
+        .iter()
+        .map(|m| {
+            let Some(value) = m.value else {
+                let types = m.types.iter().map(|ty| ty.name.clone()).collect::<Vec<_>>();
+                let shape = match types.len() {
+                    0 => "void".to_string(),
+                    1 => types.into_iter().next().unwrap_or_default(),
+                    _ => format!("({})", types.join(", ")),
+                };
+                return format!("{}: {}", m.name, shape);
+            };
+            let types = m.types.iter().map(|ty| ty.name.clone()).collect::<Vec<_>>();
+            if types.is_empty() {
+                format!("{}={}", m.name, value)
+            } else {
+                format!("{}={}: ({})", m.name, value, types.join(", "))
+            }
+        })
+        .collect::<Vec<_>>();
+    if members.is_empty() {
+        format!("{} {}", t.kind, t.name)
+    } else {
+        format!("{} {} {{ {} }}", t.kind, t.name, members.join(", "))
+    }
 }
 
 /// Compute an upgrade-safety verdict from two already-parsed [`ContractSpec`]s.
@@ -355,6 +585,87 @@ pub fn upgrade_safety_wasm(old_raw: &[u8], new_raw: &[u8]) -> Result<UpgradeVerd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- size delta / growth policy math (WASM size policy) ----
+
+    #[test]
+    fn size_delta_bytes_is_signed_and_sums_correctly() {
+        assert_eq!(size_delta_bytes(467, 10543), 10076); // growth
+        assert_eq!(size_delta_bytes(10543, 467), -10076); // shrink
+        assert_eq!(size_delta_bytes(530, 530), 0); // equal
+        assert_eq!(size_delta_bytes(0, 0), 0);
+        assert_eq!(size_delta_bytes(0, 4096), 4096);
+    }
+
+    #[test]
+    fn size_delta_pct_rounds_to_one_decimal() {
+        assert_eq!(size_delta_pct(467, 10543), Some(2157.6));
+        assert_eq!(size_delta_pct(198, 530), Some(167.7)); // 167.676… -> 167.7
+        assert_eq!(size_delta_pct(467, 467), Some(0.0)); // equal
+        assert_eq!(size_delta_pct(1000, 900), Some(-10.0)); // negative growth
+        assert_eq!(size_delta_pct(10, 10), Some(0.0));
+        // 1.44 -> 1.4 (half-away-from-zero), 1.45 -> 1.5
+        assert_eq!(size_delta_pct(1000, 1014), Some(1.4));
+        assert_eq!(size_delta_pct(1000, 1015), Some(1.5));
+    }
+
+    #[test]
+    fn size_delta_pct_zero_baseline_is_none_unless_both_zero() {
+        // Division by zero must never happen: undefined relative change -> None.
+        assert_eq!(size_delta_pct(0, 1), None);
+        assert_eq!(size_delta_pct(0, 4096), None);
+        assert_eq!(size_delta_pct(0, 0), Some(0.0)); // nothing grew
+    }
+
+    #[test]
+    fn diff_specs_reports_size_fields() {
+        let old = ContractSpec {
+            env_meta: None,
+            functions: vec![],
+            custom_types: vec![],
+            events: vec![],
+        };
+        let new = old.clone();
+        let diff = diff_specs(
+            &old,
+            &new,
+            WasmSummary {
+                hash: "o".into(),
+                size_bytes: 467,
+            },
+            WasmSummary {
+                hash: "n".into(),
+                size_bytes: 530,
+            },
+        )
+        .unwrap();
+        assert_eq!(diff.size_delta_bytes, 63);
+        assert_eq!(diff.size_delta_pct, Some(13.5));
+        // JSON key presence/shape is asserted from the real CLI output in
+        // `sdkt-cli` integration tests (this crate has no serde_json dep).
+    }
+
+    #[test]
+    fn diff_specs_zero_baseline_serializes_null_pct() {
+        let spec = ContractSpec {
+            env_meta: None,
+            functions: vec![],
+            custom_types: vec![],
+            events: vec![],
+        };
+        let diff = diff_specs(
+            &spec,
+            &spec,
+            WasmSummary::default(),
+            WasmSummary {
+                hash: "n".into(),
+                size_bytes: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(diff.size_delta_bytes, 100);
+        assert_eq!(diff.size_delta_pct, None);
+    }
     use crate::spec::tests::func_entry;
     use crate::spec::tests::spec_section;
     use stellar_xdr::ScSpecTypeDef;
@@ -427,6 +738,127 @@ mod tests {
     }
 
     #[test]
+    fn detects_changed_event_params() {
+        use crate::spec::tests::event_entry_with_params;
+        // Same event name, different params: `amount` widens and `memo` is added.
+        let old = spec_section(&[event_entry_with_params(
+            "Transfer",
+            vec![
+                ("from".into(), ScSpecTypeDef::Address),
+                ("amount".into(), ScSpecTypeDef::I128),
+            ],
+        )]);
+        let new = spec_section(&[event_entry_with_params(
+            "Transfer",
+            vec![
+                ("from".into(), ScSpecTypeDef::Address),
+                ("amount".into(), ScSpecTypeDef::U64),
+                ("memo".into(), ScSpecTypeDef::String),
+            ],
+        )]);
+        let d = diff_wasm(&old, &new).unwrap();
+        assert_eq!(d.changed_events.len(), 1);
+        assert_eq!(d.changed_events[0].name, "Transfer");
+        assert_eq!(d.changed_events[0].old.params.len(), 2);
+        assert_eq!(d.changed_events[0].old.params[1].type_.name, "i128");
+        assert_eq!(d.changed_events[0].new.params.len(), 3);
+        assert_eq!(d.changed_events[0].new.params[1].type_.name, "u64");
+        // A changed event is not an add or a remove.
+        assert!(d.added_events.is_empty());
+        assert!(d.removed_events.is_empty());
+    }
+
+    #[test]
+    fn identical_events_produce_no_change() {
+        use crate::spec::tests::event_entry_with_params;
+        let wasm = spec_section(&[event_entry_with_params(
+            "Transfer",
+            vec![("from".into(), ScSpecTypeDef::Address)],
+        )]);
+        let d = diff_wasm(&wasm, &wasm).unwrap();
+        assert!(d.changed_events.is_empty());
+        assert!(d.is_identical());
+        assert_eq!(d.total_changes(), 0);
+    }
+
+    #[test]
+    fn detects_changed_type_members() {
+        use crate::spec::tests::udt_struct_entry_with_fields;
+        // Same type name, different members: `x` widens and `z` is added.
+        let old = spec_section(&[udt_struct_entry_with_fields(
+            "Point",
+            vec![("x".into(), ScSpecTypeDef::I32)],
+        )]);
+        let new = spec_section(&[udt_struct_entry_with_fields(
+            "Point",
+            vec![
+                ("x".into(), ScSpecTypeDef::I64),
+                ("z".into(), ScSpecTypeDef::I32),
+            ],
+        )]);
+        let d = diff_wasm(&old, &new).unwrap();
+        assert_eq!(d.changed_types.len(), 1);
+        assert_eq!(d.changed_types[0].name, "Point");
+        assert_eq!(d.changed_types[0].old.members.len(), 1);
+        assert_eq!(d.changed_types[0].old.members[0].types[0].name, "i32");
+        assert_eq!(d.changed_types[0].new.members.len(), 2);
+        assert_eq!(d.changed_types[0].new.members[0].types[0].name, "i64");
+        // A changed type is not an add or a remove.
+        assert!(d.added_types.is_empty());
+        assert!(d.removed_types.is_empty());
+    }
+
+    #[test]
+    fn detects_type_kind_change() {
+        use stellar_xdr::{
+            ScSpecEntry, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0, ScSpecUdtStructFieldV0,
+            ScSpecUdtStructV0,
+        };
+        let struct_entry = ScSpecEntry::UdtStructV0(ScSpecUdtStructV0 {
+            doc: "".try_into().unwrap(),
+            lib: "soroban_sdk".try_into().unwrap(),
+            name: "Status".try_into().unwrap(),
+            fields: vec![ScSpecUdtStructFieldV0 {
+                doc: "".try_into().unwrap(),
+                name: "active".try_into().unwrap(),
+                type_: ScSpecTypeDef::Bool,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        let enum_entry = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+            doc: "".try_into().unwrap(),
+            lib: "soroban_sdk".try_into().unwrap(),
+            name: "Status".try_into().unwrap(),
+            cases: vec![ScSpecUdtEnumCaseV0 {
+                doc: "".try_into().unwrap(),
+                name: "Active".try_into().unwrap(),
+                value: 0,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        let d = diff_wasm(&spec_section(&[struct_entry]), &spec_section(&[enum_entry])).unwrap();
+        assert_eq!(d.changed_types.len(), 1);
+        assert_eq!(d.changed_types[0].name, "Status");
+        assert_eq!(d.changed_types[0].old.kind, "struct");
+        assert_eq!(d.changed_types[0].new.kind, "enum");
+    }
+
+    #[test]
+    fn identical_types_produce_no_change() {
+        use crate::spec::tests::udt_struct_entry_with_fields;
+        let wasm = spec_section(&[udt_struct_entry_with_fields(
+            "Point",
+            vec![("x".into(), ScSpecTypeDef::I32)],
+        )]);
+        let d = diff_wasm(&wasm, &wasm).unwrap();
+        assert!(d.changed_types.is_empty());
+        assert!(d.is_identical());
+        assert_eq!(d.total_changes(), 0);
+    }
+
+    #[test]
     fn parse_error_propagates() {
         // "old" is valid but has no contract spec; "new" is a valid spec.
         let old = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -460,6 +892,134 @@ mod tests {
     }
 
     #[test]
+    fn verdict_flags_changed_event_breaking() {
+        use crate::spec::tests::event_entry_with_params;
+        let old = spec_section(&[event_entry_with_params(
+            "Transfer",
+            vec![("amount".into(), ScSpecTypeDef::I128)],
+        )]);
+        let new = spec_section(&[event_entry_with_params(
+            "Transfer",
+            vec![("amount".into(), ScSpecTypeDef::U64)],
+        )]);
+        let v = upgrade_safety_wasm(&old, &new).unwrap();
+        assert!(!v.compatible);
+        assert_eq!(v.breaking_changes.len(), 1);
+        assert_eq!(v.breaking_changes[0].kind, ChangeKind::ChangedEvent);
+        assert_eq!(v.breaking_changes[0].name, "Transfer");
+        // The detail shows both shapes so the change is actionable.
+        let d = &v.breaking_changes[0].detail;
+        assert!(d.contains("i128"), "detail should show the old type: {}", d);
+        assert!(d.contains("u64"), "detail should show the new type: {}", d);
+    }
+
+    #[test]
+    fn detects_changed_enum_discriminant() {
+        use stellar_xdr::{ScSpecEntry, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0};
+        // Same case names, different discriminants: stored data that decoded
+        // as `Active` would now resolve to a different case.
+        let enum_with = |value: u32| {
+            ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+                doc: "".try_into().unwrap(),
+                lib: "soroban_sdk".try_into().unwrap(),
+                name: "Status".try_into().unwrap(),
+                cases: vec![
+                    ScSpecUdtEnumCaseV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "Active".try_into().unwrap(),
+                        value: 0,
+                    },
+                    ScSpecUdtEnumCaseV0 {
+                        doc: "".try_into().unwrap(),
+                        name: "Paused".try_into().unwrap(),
+                        value,
+                    },
+                ]
+                .try_into()
+                .unwrap(),
+            })
+        };
+        let d = diff_wasm(
+            &spec_section(&[enum_with(1)]),
+            &spec_section(&[enum_with(2)]),
+        )
+        .unwrap();
+        assert_eq!(d.changed_types.len(), 1);
+        assert_eq!(d.changed_types[0].name, "Status");
+        assert_eq!(
+            d.changed_types[0].old.members[1].value,
+            Some(1),
+            "old discriminant must be retained"
+        );
+        assert_eq!(d.changed_types[0].new.members[1].value, Some(2));
+        // Breaking, with both discriminants visible in the detail.
+        let v = upgrade_safety(
+            &parse_contract_spec(&spec_section(&[enum_with(1)])).unwrap(),
+            &parse_contract_spec(&spec_section(&[enum_with(2)])).unwrap(),
+        );
+        assert!(!v.compatible);
+        assert_eq!(
+            v.breaking_changes[0].kind,
+            ChangeKind::ChangedTypeDefinition
+        );
+        assert!(
+            v.breaking_changes[0].detail.contains("Paused=1"),
+            "{}",
+            v.breaking_changes[0].detail
+        );
+        assert!(
+            v.breaking_changes[0].detail.contains("Paused=2"),
+            "{}",
+            v.breaking_changes[0].detail
+        );
+    }
+
+    #[test]
+    fn identical_enum_discriminants_produce_no_change() {
+        use stellar_xdr::{ScSpecEntry, ScSpecUdtEnumCaseV0, ScSpecUdtEnumV0};
+        let entry = ScSpecEntry::UdtEnumV0(ScSpecUdtEnumV0 {
+            doc: "".try_into().unwrap(),
+            lib: "soroban_sdk".try_into().unwrap(),
+            name: "Status".try_into().unwrap(),
+            cases: vec![ScSpecUdtEnumCaseV0 {
+                doc: "".try_into().unwrap(),
+                name: "Active".try_into().unwrap(),
+                value: 7,
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        let wasm = spec_section(&[entry]);
+        let d = diff_wasm(&wasm, &wasm).unwrap();
+        assert!(d.changed_types.is_empty());
+        assert!(d.is_identical());
+    }
+
+    #[test]
+    fn verdict_flags_changed_type_definition_breaking() {
+        use crate::spec::tests::udt_struct_entry_with_fields;
+        let old = spec_section(&[udt_struct_entry_with_fields(
+            "Point",
+            vec![("x".into(), ScSpecTypeDef::I32)],
+        )]);
+        let new = spec_section(&[udt_struct_entry_with_fields(
+            "Point",
+            vec![("x".into(), ScSpecTypeDef::I64)],
+        )]);
+        let v = upgrade_safety_wasm(&old, &new).unwrap();
+        assert!(!v.compatible);
+        assert_eq!(v.breaking_changes.len(), 1);
+        assert_eq!(
+            v.breaking_changes[0].kind,
+            ChangeKind::ChangedTypeDefinition
+        );
+        assert_eq!(v.breaking_changes[0].name, "Point");
+        let d = &v.breaking_changes[0].detail;
+        assert!(d.contains("i32"), "detail should show the old type: {}", d);
+        assert!(d.contains("i64"), "detail should show the new type: {}", d);
+    }
+
+    #[test]
     fn verdict_flags_removed_event_breaking() {
         use crate::spec::tests::event_entry;
         let old = spec_section(&[event_entry("Transfer")]);
@@ -485,20 +1045,21 @@ mod tests {
 
     #[test]
     fn verdict_only_additions_is_compatible() {
+        use crate::spec::tests::event_entry;
         let old = spec_section(&[func_entry("a", vec![])]);
         let new = spec_section(&[
             func_entry("a", vec![]),
             func_entry("b", vec![("x".into(), ScSpecTypeDef::U32)]),
         ]);
-        use crate::spec::tests::event_entry;
         let old2 = spec_section(&[func_entry("a", vec![])]);
         let new2 = spec_section(&[func_entry("a", vec![]), event_entry("Mint")]);
-        let _ = (old, new); // silence unused
-        let v = upgrade_safety_wasm(&old2, &new2).unwrap();
+        let v = upgrade_safety_wasm(&old, &new).unwrap();
         assert!(v.compatible);
-        assert!(v.breaking_changes.is_empty());
-        assert!(!v.non_breaking_changes.is_empty());
-        assert!(v
+        let v2 = upgrade_safety_wasm(&old2, &new2).unwrap();
+        assert!(v2.compatible);
+        assert!(v2.breaking_changes.is_empty());
+        assert!(!v2.non_breaking_changes.is_empty());
+        assert!(v2
             .non_breaking_changes
             .iter()
             .any(|c| c.kind == ChangeKind::AddedEvent && c.name == "Mint"));

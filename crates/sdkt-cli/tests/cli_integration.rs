@@ -12,17 +12,29 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+/// Unique suffix for temp dirs: process id + timestamp + counter.
+/// The counter guarantees no two calls collide, even on macOS where the
+/// clock only has microsecond precision.
+fn unique_suffix() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        nanos,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Build a `sdkt` command with an isolated network-profile directory.
 fn sdkt_isolated() -> Command {
     let mut cmd = Command::cargo_bin("sdkt").expect("sdkt binary built");
     // Point network storage at a fresh temp dir for determinism.
-    let dir = std::env::temp_dir().join(format!(
-        "sdkt-it-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("sdkt-it-{}", unique_suffix()));
     let _ = std::fs::create_dir_all(&dir);
     cmd.env("SDKT_NETWORK_DIR", &dir);
     cmd
@@ -41,12 +53,26 @@ fn help_lists_all_top_level_commands() {
 }
 
 #[test]
+fn call_and_invoke_help_document_json_arguments() {
+    for command in ["call", "invoke"] {
+        sdkt_isolated()
+            .args([command, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--args-json"));
+    }
+}
+
+#[test]
 fn version_reports_current_release() {
     sdkt_isolated()
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("sdkt 2.5.0"));
+        .stdout(predicate::str::contains(format!(
+            "sdkt {}",
+            env!("CARGO_PKG_VERSION")
+        )));
 }
 
 #[test]
@@ -105,13 +131,8 @@ fn completions_rejects_unknown_shell() {
 #[test]
 fn network_add_then_list_then_show_then_remove_json() {
     // Shared, isolated network directory for the whole flow.
-    let dir = std::env::temp_dir().join(format!(
-        "sdkt-it-flow-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("sdkt-it-flow-{}", unique_suffix()));
+
     let _ = std::fs::create_dir_all(&dir);
     let _guard = {
         struct G(std::path::PathBuf);
@@ -245,7 +266,7 @@ fn completions_broken_pipe_exits_successfully() {
 // ---------------------------------------------------------------------------
 
 /// Build a temp project: `.sdkt.toml` + two contract dirs each with a fake
-/// `target/wasm32-unknown-unknown/release/<name>.wasm`. Returns the temp root.
+/// `target/wasm32v1-none/release/<name>.wasm`. Returns the temp root.
 fn make_lock_fixture(root: &std::path::Path, token_bytes: &[u8], router_bytes: &[u8]) {
     std::fs::create_dir_all(root).unwrap();
     std::fs::write(
@@ -267,7 +288,7 @@ deploy_after = ["token"]
             .join("contracts")
             .join(name)
             .join("target")
-            .join("wasm32-unknown-unknown")
+            .join(sdkt_core::build::WASM_BUILD_TARGET)
             .join("release");
         std::fs::create_dir_all(&wasm_dir).unwrap();
         std::fs::write(wasm_dir.join(format!("{}.wasm", name)), bytes).unwrap();
@@ -341,7 +362,9 @@ fn lock_verify_detects_drift() {
     // Now tamper with the token artifact.
     let token_wasm = tmp
         .join("contracts/token")
-        .join("target/wasm32-unknown-unknown/release/token.wasm");
+        .join("target")
+        .join(sdkt_core::build::WASM_BUILD_TARGET)
+        .join("release/token.wasm");
     std::fs::write(&token_wasm, b"tampered-token-bytes").unwrap();
 
     let mut verify = Command::cargo_bin("sdkt").expect("sdkt binary built");
@@ -490,6 +513,154 @@ fn build_rejects_duplicate_contract_name() {
         !out.is_empty(),
         "duplicate contract name must produce a load error: {}",
         out
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ---------------------------------------------------------------------------
+// `sdkt build --format json` (machine-readable, offline, hermetic).
+// ---------------------------------------------------------------------------
+
+/// Write a single-contract project whose `src/lib.rs` builds for
+/// `wasm32v1-none` with no external dependencies, so the success path needs
+/// no network and no prebuilt artifact.
+fn write_buildable_no_std_project(root: &std::path::Path) {
+    let contract = root.join("contracts").join("token");
+    std::fs::create_dir_all(contract.join("src")).unwrap();
+    std::fs::write(
+        root.join(".sdkt.toml"),
+        "[contracts.token]\npath = \"contracts/token\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        contract.join("Cargo.toml"),
+        "[package]\nname = \"token\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [lib]\ncrate-type = [\"cdylib\"]\n",
+    )
+    .unwrap();
+    // `#![no_std]` + a panic handler are required by wasm32v1-none, and the
+    // crate has no dependencies, so this compiles offline in well under a
+    // second when the wasm32v1-none std-less target is installed.
+    std::fs::write(
+        contract.join("src").join("lib.rs"),
+        "#![no_std]\n\
+         #[panic_handler]\n\
+         fn p(_: &core::panic::PanicInfo) -> ! { loop {} }\n\
+         #[no_mangle]\n\
+         pub extern \"C\" fn f() {}\n",
+    )
+    .unwrap();
+}
+
+/// True when the wasm32v1-none target is installed for the active toolchain,
+/// i.e. a real `sdkt build` can compile to the artifact.
+fn wasm32v1_none_installed() -> bool {
+    std::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == sdkt_core::build::WASM_BUILD_TARGET)
+        })
+        .unwrap_or(false)
+}
+
+#[test]
+fn build_json_success_emits_only_a_json_document() {
+    if !wasm32v1_none_installed() {
+        eprintln!("skipping: wasm32v1-none target not installed");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "sdkt-it-build-json-ok-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    write_buildable_no_std_project(&tmp);
+
+    let mut cmd = Command::cargo_bin("sdkt").expect("sdkt binary built");
+    let assert = cmd
+        .current_dir(&tmp)
+        .args(["build", "--format", "json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).clone();
+
+    // stdout must be parseable on its own: the advisory lock report written by
+    // the build engine must not contaminate the JSON document.
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}"));
+    assert_eq!(v["success"], serde_json::json!(true));
+    let artifacts = v["artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("artifacts must be an array: {v}"));
+    assert_eq!(artifacts.len(), 1, "one contract configured: {v}");
+    assert_eq!(artifacts[0]["alias"], serde_json::json!("token"));
+    assert!(artifacts[0]["wasm_artifact"]
+        .as_str()
+        .expect("wasm_artifact path")
+        .ends_with(".wasm"));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn build_json_failure_emits_error_envelope_and_exits_nonzero() {
+    // No [contracts] configured: the failure must be machine-readable on
+    // stdout (an `error` envelope) and still exit non-zero.
+    let tmp = std::env::temp_dir().join(format!(
+        "sdkt-it-build-json-err-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join(".sdkt.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("sdkt").expect("sdkt binary built");
+    let assert = cmd
+        .current_dir(&tmp)
+        .args(["build", "--format", "json"])
+        .assert()
+        .failure();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).clone();
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("invalid JSON ({e}): {stdout}"));
+    assert_eq!(v["success"], serde_json::json!(false));
+    assert!(
+        v["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "error envelope must carry a message: {v}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn build_pretty_output_unchanged() {
+    // The default (pretty) form must keep printing the human summary on
+    // stdout; the JSON form is strictly additive.
+    let tmp = std::env::temp_dir().join(format!(
+        "sdkt-it-build-pretty-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    write_sdkt_toml(&tmp, "[contracts.router]\npath = \"contracts/router\"\n");
+
+    let mut cmd = Command::cargo_bin("sdkt").expect("sdkt binary built");
+    let assert = cmd.current_dir(&tmp).arg("build").assert().failure();
+    let out = String::from_utf8_lossy(&assert.get_output().stderr);
+    assert!(
+        out.contains("Error building workspace"),
+        "pretty failure message must stay on stderr: {out}"
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -651,13 +822,7 @@ fn package_validate_rejects_self_dependency() {
 // ---------------------------------------------------------------------------
 
 fn make_local_git_repo() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "sdkt-it-gitsrc-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("sdkt-it-gitsrc-{}", unique_suffix()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let run = |args: &[&str]| {
@@ -902,13 +1067,7 @@ fn package_fetch_writes_locked_dependencies() {
 /// stays at v1 until a test calls `advance_repo` (moves HEAD + re-tags), so
 /// `fetch` records the OLD commit and a later `update` has something to pull.
 fn make_advancing_repo() -> (std::path::PathBuf, String, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "sdkt-it-sync-remote-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("sdkt-it-sync-remote-{}", unique_suffix()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let run = |args: &[&str]| {
@@ -969,14 +1128,7 @@ fn advance_repo(src: &std::path::Path) {
 /// Build a local "remote" with multiple semver tags so the version resolver
 /// has a choice. Tags: v1.0.0, v1.5.0, v2.0.0 (HEAD sits at v2.0.0).
 fn make_version_repo() -> (std::path::PathBuf, String, String, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "sdkt-it-ver-remote-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("sdkt-it-ver-remote-{}", unique_suffix()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let run = |args: &[&str]| {
@@ -1435,14 +1587,7 @@ fn package_update_version_constraint_unsatisfied_reports_error() {
 /// Build a local "remote" git repo with a single tag `v1.0.0` for pack
 /// tests. Offline; no network.
 fn make_pack_repo() -> (std::path::PathBuf, String) {
-    let dir = std::env::temp_dir().join(format!(
-        "sdkt-it-m38-remote-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(format!("sdkt-it-m38-remote-{}", unique_suffix()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let run = |args: &[&str]| {

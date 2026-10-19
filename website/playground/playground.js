@@ -20,6 +20,8 @@
   const $ = (id) => document.getElementById(id);
   const dropzone = $('dropzone');
   const fileInput = $('fileInput');
+  const candidateInput = $('candidateInput');
+  const candidateName = $('candidateName');
   const filebar = $('filebar');
   const fname = $('fname');
   const fmeta = $('fmeta');
@@ -34,9 +36,14 @@
   // (transactions) will plug in here; the local inspector never touches it.
   const networkProvider = { mode: 'local', supported: ['local'] };
 
+  const REQUEST_TIMEOUT_MS = 30000;  // 30 seconds — timeout for worker requests
+
   let nextId = 1;
   const pending = new Map();
   let currentFile = null;
+  let currentBytes = null;
+  let candidateFile = null;
+  let candidateBytes = null;
   let inspected = false;
 
   // Monotonic selection generation. Every user selection (upload or example)
@@ -91,7 +98,22 @@
   function post(msg) {
     return new Promise((resolve, reject) => {
       const id = nextId++;
-      pending.set(id, { resolve, reject });
+      let timeoutHandle = null;
+      const cleanup = () => {
+        if (timeoutHandle !== null) clearTimeout(timeoutHandle);
+        pending.delete(id);
+      };
+      const resolve_ = (value) => { cleanup(); resolve(value); };
+      const reject_ = (error) => { cleanup(); reject(error); };
+      
+      // Set up the timeout. If it fires, reject the promise and clean up.
+      timeoutHandle = setTimeout(() => {
+        pending.delete(id);
+        const operationName = msg.type || 'unknown operation';
+        reject_(new Error(operationName + ' timed out after ' + REQUEST_TIMEOUT_MS + ' ms'));
+      }, REQUEST_TIMEOUT_MS);
+      
+      pending.set(id, { resolve: resolve_, reject: reject_ });
       worker.postMessage(Object.assign({ id }, msg));
     });
   }
@@ -340,6 +362,17 @@
     if (data.duration_ms !== undefined) {
       metaRows.push(['Inspection time', data.duration_ms + ' ms']);
     }
+    const structureFields = ['function_count', 'table_count', 'global_count', 'data_segment_count'];
+    if (structureFields.some((key) => meta[key] !== undefined) || meta.memory !== undefined) {
+      metaRows.push(['Functions', meta.function_count !== undefined ? String(meta.function_count) : '—']);
+      metaRows.push(['Tables', meta.table_count !== undefined ? String(meta.table_count) : '—']);
+      metaRows.push(['Globals', meta.global_count !== undefined ? String(meta.global_count) : '—']);
+      metaRows.push(['Data segments', meta.data_segment_count !== undefined ? String(meta.data_segment_count) : '—']);
+      if (meta.memory) {
+        metaRows.push(['Memory', String(meta.memory.initial_pages) + ' initial pages' +
+          (meta.memory.maximum_pages == null ? '' : ' · ' + meta.memory.maximum_pages + ' maximum')]);
+      }
+    }
     const metaTable = kvTable(metaRows);
     // Copy button for the hash (the one value developers actually copy).
     if (meta.hash) {
@@ -348,6 +381,20 @@
     }
     metaSec.appendChild(metaTable);
     results.appendChild(metaSec);
+
+    // 1b. Contract metadata (contractmetav0). Rendered verbatim from the
+    // decoded `SCMetaV0` entries — the same `metadata.contract_meta` array the
+    // CLI prints as `Contract Metadata (n):`, in section order, duplicates and
+    // unknown keys preserved. No vocabulary is assumed in JS.
+    const contractMeta = (meta.contract_meta || []).slice();
+    const cmSec = section('Contract Metadata',
+      contractMeta.length + (contractMeta.length === 1 ? ' item' : ' items'));
+    if (contractMeta.length) {
+      cmSec.appendChild(kvTable(contractMeta.map((e) => [e.key, e.value])));
+    } else {
+      cmSec.appendChild(kvTable([['Entries', 'none']]));
+    }
+    results.appendChild(cmSec);
 
     // 2. Exports
     const exps = (meta.exports || []).slice();
@@ -379,7 +426,24 @@
     }
     results.appendChild(csSec);
 
-    // 5. Contract specification (optional)
+    // 5. Structural metrics (present in newer metadata payloads).
+    const metricsSec = section('Structural Metrics', 'WASM structure');
+    const memory = meta.memory || null;
+    const memoryValue = memory
+      ? String(memory.initial_pages ?? 0) + ' pages (max: ' +
+        (memory.maximum_pages === null || memory.maximum_pages === undefined
+          ? 'unbounded' : String(memory.maximum_pages) + ' pages') + ')'
+      : 'none';
+    metricsSec.appendChild(kvTable([
+      ['Functions (declared)', String(meta.function_count ?? 0)],
+      ['Memory', memoryValue],
+      ['Tables', String(meta.table_count ?? 0)],
+      ['Globals', String(meta.global_count ?? 0)],
+      ['Data Segments', String(meta.data_segment_count ?? 0)],
+    ]));
+    results.appendChild(metricsSec);
+
+    // 6. Contract specification (optional)
     const specSec = section('Contract Specification', spec ? 'available' : 'not present');
     if (spec) {
       specSec.appendChild(renderFunctions(spec.functions || []));
@@ -397,9 +461,83 @@
       specSec.appendChild(note);
     }
     results.appendChild(specSec);
+    renderUpgrade(null);
 
     results.classList.remove('hidden');
     inspected = true;
+  }
+
+  function changeLabel(change) {
+    const labels = {
+      removed_function: 'Removed function', changed_signature: 'Changed signature',
+      removed_event: 'Removed event', removed_type: 'Removed type',
+      added_function: 'Added function', added_event: 'Added event', added_type: 'Added type',
+      changed_event: 'Changed event', changed_type_definition: 'Changed type definition',
+    };
+    const label = labels[change.kind] || change.kind;
+    const suffix = ['removed_function', 'changed_signature', 'added_function'].includes(change.kind) ? '()' : '';
+    return label + ': ' + (change.name || '') + suffix;
+  }
+
+  function renderUpgrade(verdict) {
+    const previous = results.querySelector('[data-upgrade-safety]');
+    if (previous) previous.remove();
+    const sec = section('Upgrade Safety', verdict ? (verdict.compatible ? 'compatible' : 'breaking') : 'waiting');
+    sec.setAttribute('data-upgrade-safety', 'true');
+    if (!verdict) {
+      sec.appendChild(kvTable([['Status', 'Load a candidate WASM to compare it with the inspected base.']]));
+      results.appendChild(sec);
+      return;
+    }
+    const rows = [['Compatible', verdict.compatible ? 'yes' : 'no']];
+    sec.appendChild(kvTable(rows));
+    const appendChangeGroup = (label, attr, changes) => {
+      const group = document.createElement('div');
+      group.className = 'upgrade-change-group';
+      group.setAttribute(attr, 'true');
+      const heading = document.createElement('h3');
+      heading.textContent = label;
+      group.appendChild(heading);
+      if (changes.length) {
+        group.appendChild(kvChips(changes.map((change) => ({
+          k: change.kind,
+          v: change.detail ? changeLabel(change) + ' — ' + change.detail : changeLabel(change),
+        }))));
+      } else {
+        const empty = document.createElement('p');
+        empty.className = 'empty-state';
+        empty.textContent = 'None';
+        group.appendChild(empty);
+      }
+      sec.appendChild(group);
+    };
+    appendChangeGroup('Breaking changes', 'data-breaking-changes', verdict.breaking_changes || []);
+    appendChangeGroup('Non-breaking changes', 'data-non-breaking-changes', verdict.non_breaking_changes || []);
+    results.appendChild(sec);
+  }
+
+  function compareFiles(gen) {
+    if (!currentBytes || !candidateBytes) return;
+    setStatus('loading', 'comparing…');
+    post({ type: 'diff', oldBytes: currentBytes, newBytes: candidateBytes }).then((verdict) => {
+      if (!isCurrent(gen)) return;
+      renderUpgrade(verdict);
+      setStatus('ok', verdict.compatible ? 'upgrade is compatible' : 'breaking changes detected');
+    }).catch((err) => {
+      if (!isCurrent(gen)) return;
+      const errMsg = String(err && err.message ? err.message : err);
+      const isTimeout = errMsg.includes('timed out');
+      setStatus('err', isTimeout ? 'comparison timed out' : 'comparison failed');
+      renderUpgrade(null);
+      const sec = results.querySelector('[data-upgrade-safety]');
+      if (sec) {
+        if (isTimeout) {
+          sec.appendChild(kvTable([['Error', errMsg + '. The comparison timed out; the file may be too large or complex. Reload and try again.']]));
+        } else {
+          sec.appendChild(kvTable([['Error', errMsg]]));
+        }
+      }
+    });
   }
 
   /* ---------- file flow ---------- */
@@ -411,6 +549,11 @@
     // Extension + content validation happens in inspect() after read; the
     // picker is restricted to .wasm already, but drops can bypass that.
     currentFile = file;
+    currentBytes = null;
+    candidateFile = null;
+    candidateBytes = null;
+    candidateInput.value = '';
+    candidateName.textContent = 'No candidate loaded';
     filebar.hidden = false;
     fname.textContent = file.name;
     fmeta.textContent = fmtSize(file.size) + ' · ' + (file.type || 'application/octet-stream');
@@ -424,6 +567,7 @@
   function inspectFile(file, gen) {
     file.arrayBuffer().then((buf) => {
       const bytes = new Uint8Array(buf);
+      currentBytes = bytes;
       return post({ type: 'inspect', bytes });
     }).then((result) => {
       if (!isCurrent(gen)) return;
@@ -431,10 +575,19 @@
         ? ' · ' + result.duration_ms + ' ms' : '';
       setStatus('ok', 'inspection complete' + dur);
       render(result);
+      compareFiles(gen);
     }).catch((err) => {
       if (!isCurrent(gen)) return;
-      setStatus('err', 'inspection failed');
-      showError(String(err && err.message ? err.message : err));
+      const errMsg = String(err && err.message ? err.message : err);
+      const isTimeout = errMsg.includes('timed out');
+      setStatus('err', isTimeout ? 'inspection timed out' : 'inspection failed');
+      if (isTimeout) {
+        showError('The inspection timed out (' + errMsg + '). ' +
+          'The file may be too large or complex to process. ' +
+          'You can reload the playground and try again, or try a smaller file.');
+      } else {
+        showError(errMsg);
+      }
     });
   }
 
@@ -452,7 +605,14 @@
       .then((buf) => {
         if (!isCurrent(gen)) return;
         const file = new File([new Uint8Array(buf)], ex.label, { type: 'application/wasm' });
-        acceptFile(file, gen);
+        if (key === 'us_new' && currentFile) {
+          candidateFile = file;
+          candidateBytes = new Uint8Array(buf);
+          candidateName.textContent = file.name;
+          compareFiles(gen);
+        } else {
+          acceptFile(file, gen);
+        }
       })
       .catch((err) => {
         if (!isCurrent(gen)) return;
@@ -467,8 +627,13 @@
     // Invalidate any in-flight fetch/inspection so it cannot re-render after reset.
     beginSelection();
     currentFile = null;
+    currentBytes = null;
+    candidateFile = null;
+    candidateBytes = null;
+    candidateName.textContent = 'No candidate loaded';
     inspected = false;
     fileInput.value = '';
+    candidateInput.value = '';
     filebar.hidden = true;
     results.classList.add('hidden');
     clearError();
@@ -480,6 +645,25 @@
 
   fileInput.addEventListener('change', () => {
     if (fileInput.files && fileInput.files[0]) acceptFile(fileInput.files[0]);
+  });
+
+  candidateInput.addEventListener('change', () => {
+    const file = candidateInput.files && candidateInput.files[0];
+    if (!file || !currentFile) {
+      candidateInput.value = '';
+      if (!currentFile) showError('Inspect a base WASM before choosing a candidate.');
+      return;
+    }
+    const gen = beginSelection();
+    candidateFile = file;
+    candidateName.textContent = file.name;
+    file.arrayBuffer().then((buf) => {
+      if (!isCurrent(gen)) return;
+      candidateBytes = new Uint8Array(buf);
+      compareFiles(gen);
+    }).catch((err) => {
+      if (isCurrent(gen)) showError(String(err && err.message ? err.message : err));
+    });
   });
 
   ['dragenter', 'dragover'].forEach((evt) =>

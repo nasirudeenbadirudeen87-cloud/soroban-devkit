@@ -1,15 +1,19 @@
 name: "Soroban DevKit (sdkt) Action"
-description: "Run sdkt capabilities in CI: static security audit (sdkt audit) and contract upgrade-safety check (sdkt diff --upgrade-safety)."
+description: "Run sdkt capabilities in CI: static security audit (sdkt audit), contract upgrade-safety check (sdkt diff --upgrade-safety), and read-only release assurance (sdkt release-assurance)."
 author: "SaboLabs"
 
 inputs:
   command:
-    description: "Which check to run: 'audit' or 'upgrade-safety'."
+    description: "Which check to run: 'audit', 'upgrade-safety', or 'release-assurance'."
     required: true
   sdkt-version:
-    description: "sdkt git tag to install (e.g. v1.0.0). Must be a published tag in SaboLabs/soroban-devkit."
+    description: "sdkt release tag to install (e.g. v2.7.0). Must be a published release in SaboLabs/soroban-devkit with a prebuilt asset for the runner platform."
     required: false
-    default: "v1.0.0"
+    default: "v2.7.0"
+  install-from-source:
+    description: "Build sdkt from source instead of downloading the release binary. Slower (~4-5 min) but works on platforms without a published asset. One of: 'false', 'true'. Default: false."
+    required: false
+    default: "false"
   target:
     description: "Source file (.rs) to audit (used with command=audit)."
     required: false
@@ -26,31 +30,169 @@ inputs:
     description: "Minimum severity that fails the audit. One of: critical, warning, info. Default: critical (MOVE-001 warnings never fail CI)."
     required: false
     default: "critical"
+  wasm:
+    description: "Candidate WASM artifact to assess (used with command=release-assurance). Required for that command."
+    required: false
+    default: ""
+  previous-wasm:
+    description: "Previous (baseline) WASM for the offline upgrade-safety diff (used with command=release-assurance). Optional."
+    required: false
+    default: ""
+  audit:
+    description: "Rust source file(s) or directory for the static audit (used with command=release-assurance). Space-separated; each becomes a separate --audit argument."
+    required: false
+    default: ""
+  disable:
+    description: "Audit rule id(s) to disable (used with command=release-assurance). Space-separated; each becomes a repeated --disable argument."
+    required: false
+    default: ""
+  contract:
+    description: "Deployed contract ID (C...) for the on-chain verification + health checks (used with command=release-assurance). Optional; on-chain checks are skipped when empty."
+    required: false
+    default: ""
+  network:
+    description: "Deployed network (testnet | mainnet | futurenet) for the on-chain checks (used with command=release-assurance). Only meaningful with 'contract'."
+    required: false
+    default: ""
+  max-size-bytes:
+    description: "Fail the release when the candidate artifact exceeds N bytes (used with command=release-assurance). Optional; forwards --max-size-bytes. Operator-supplied policy, SDKT hardcodes no network limit. Violates when size > N; exactly N passes."
+    required: false
+    default: ""
+  max-growth-pct:
+    description: "Fail the release when the candidate grew more than N percent over 'previous-wasm' (used with command=release-assurance). Optional; forwards --max-growth-pct. Requires 'previous-wasm'. Violates when growth > N; exactly N passes."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
   steps:
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
     - name: Install sdkt
       shell: bash
+      env:
+        SDKT_VERSION: ${{ inputs.sdkt-version }}
+        SDKT_FROM_SOURCE: ${{ inputs.install-from-source }}
+        SDKT_REPO: SaboLabs/soroban-devkit
       run: |
-        # When this Action runs inside the sdkt repository itself (e.g. during
-        # PR validation), the checked-out workspace already contains the CLI.
-        # Install from the local path instead of fetching a git tag — the tag
-        # may not exist on the remote yet. For external consumers, fall back to
-        # the published git tag. External behavior is unchanged.
+        set -euo pipefail
+        # Inside the sdkt repository itself (PR validation), the checked-out
+        # workspace is the source of truth: install from the local path so the
+        # Action is validated against the code under review, not a published
+        # tag that may not exist yet.
         if [ -f "crates/sdkt-cli/Cargo.toml" ]; then
           echo "Detected sdkt workspace checkout — installing from local path."
+          rustup toolchain install stable --profile minimal >/dev/null 2>&1 || true
           cargo install --path crates/sdkt-cli --locked
-        else
-          echo "External consumer — installing from git tag ${{ inputs.sdkt-version }}."
-          cargo install --git https://github.com/SaboLabs/soroban-devkit --tag "${{ inputs.sdkt-version }}" sdkt-cli --locked
+          INSTALL_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+          echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+          exit 0
         fi
 
-        INSTALL_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+        if [ "$SDKT_FROM_SOURCE" = "true" ]; then
+          echo "install-from-source=true — building sdkt $SDKT_VERSION from the git tag."
+          rustup toolchain install stable --profile minimal >/dev/null 2>&1 || true
+          cargo install --git "https://github.com/$SDKT_REPO" --tag "$SDKT_VERSION" sdkt-cli --locked
+          INSTALL_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+          echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+          exit 0
+        fi
+
+        # Default path for external consumers: download the published release
+        # binary. `cargo install --git` compiles the whole workspace from
+        # source (~4-5 minutes of CI time per run); the release assets are the
+        # same code, already built and checksummed by release.yml.
+        case "$(uname -s)" in
+          Linux)  OS=linux ;;
+          Darwin) OS=macos ;;
+          MINGW*|MSYS*|CYGWIN*) OS=windows ;;
+          *) echo "::error::unsupported runner kernel: $(uname -s). Set install-from-source: true."; exit 1 ;;
+        esac
+        ARCH="$(uname -m)"
+        case "$OS/$ARCH" in
+          linux/x86_64)   TARGET=x86_64-unknown-linux-gnu ;;
+          linux/aarch64)  TARGET=aarch64-unknown-linux-gnu ;;
+          macos/x86_64)   TARGET=x86_64-apple-darwin ;;
+          macos/arm64)    TARGET=aarch64-apple-darwin ;;
+          windows/x86_64) TARGET=x86_64-pc-windows-msvc ;;
+          *) echo "::error::no prebuilt asset for $OS/$ARCH. Set install-from-source: true."; exit 1 ;;
+        esac
+
+        if [ "$OS" = windows ]; then
+          ASSET="sdkt-${TARGET}.zip"
+        else
+          ASSET="sdkt-${TARGET}.tar.gz"
+        fi
+        BASE="https://github.com/$SDKT_REPO/releases/download/$SDKT_VERSION"
+        TMP="$(mktemp -d)"
+        echo "Downloading $ASSET from $SDKT_VERSION ..."
+        curl -fsSL "$BASE/$ASSET" -o "$TMP/$ASSET" || {
+          echo "::error::release asset $ASSET not found for $SDKT_VERSION. Older tags predate some platforms; set install-from-source: true."
+          exit 1
+        }
+
+        # Extract first: the archive carries both the binary and its
+        # `sdkt.sha256`, and the checksum names the binary by its bare
+        # filename, so verification must run where both live.
+        if [ "$OS" = windows ]; then
+          unzip -o -q "$TMP/$ASSET" -d "$TMP" || { echo "::error::could not unpack $ASSET"; exit 1; }
+        else
+          tar -xzf "$TMP/$ASSET" -C "$TMP" || { echo "::error::could not unpack $ASSET"; exit 1; }
+        fi
+
+        # Verify the checksum before executing anything. A standalone
+        # `sdkt-<target>.sha256` asset wins when present; otherwise the copy
+        # embedded in the archive is used. Verification is never skipped: if no
+        # checksum can be obtained, the install fails.
+        if curl -fsSL "$BASE/sdkt-${TARGET}.sha256" -o "$TMP/sdkt.sha256" 2>/dev/null; then
+          echo "Using standalone checksum asset."
+        elif [ -f "$TMP/sdkt.sha256" ]; then
+          echo "Using checksum embedded in $ASSET."
+        else
+          echo "::error::no checksum available for $ASSET; refusing to install an unverified binary. Set install-from-source: true."
+          exit 1
+        fi
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          (cd "$TMP" && sha256sum -c sdkt.sha256)
+        elif command -v shasum >/dev/null 2>&1; then
+          (cd "$TMP" && shasum -a 256 -c sdkt.sha256)
+        else
+          echo "::error::no sha256 tool available (sha256sum/shasum). Set install-from-source: true."
+          exit 1
+        fi
+
+        INSTALL_DIR="${RUNNER_TEMP:-$TMP}/sdkt-bin"
+        mkdir -p "$INSTALL_DIR"
+        if [ "$OS" = windows ]; then
+          cp "$TMP/sdkt.exe" "$INSTALL_DIR/sdkt.exe"
+        else
+          cp "$TMP/sdkt" "$INSTALL_DIR/sdkt"
+          chmod +x "$INSTALL_DIR/sdkt"
+        fi
         echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+        "$INSTALL_DIR/sdkt" --version
+
+    - name: Ensure jq
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The gate steps below parse sdkt's JSON output with jq. jq is
+        # preinstalled on ubuntu runners but NOT on macOS or Windows runners,
+        # so it is provisioned here rather than assumed.
+        if command -v jq >/dev/null 2>&1; then
+          echo "jq present: $(jq --version)"
+          exit 0
+        fi
+        if command -v apt-get >/dev/null 2>&1; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+        elif command -v brew >/dev/null 2>&1; then
+          brew install jq
+        elif command -v choco >/dev/null 2>&1; then
+          choco install -y jq
+        else
+          echo "::error::jq is required by this Action but no supported package manager was found."
+          exit 1
+        fi
+        jq --version
 
     - name: Run sdkt audit
       if: ${{ inputs.command == 'audit' }}
@@ -106,3 +248,57 @@ runs:
           exit 1
         fi
         echo "sdkt upgrade-safety passed (upgrade is backwards-compatible)."
+
+    - name: Run sdkt release-assurance
+      if: ${{ inputs.command == 'release-assurance' }}
+      shell: bash
+      env:
+        SDKT_WASM: ${{ inputs.wasm }}
+        SDKT_PREV_WASM: ${{ inputs.previous-wasm }}
+        SDKT_AUDIT: ${{ inputs.audit }}
+        SDKT_DISABLE: ${{ inputs.disable }}
+        SDKT_CONTRACT: ${{ inputs.contract }}
+        SDKT_NETWORK: ${{ inputs.network }}
+        SDKT_MAX_SIZE_BYTES: ${{ inputs.max-size-bytes }}
+        SDKT_MAX_GROWTH_PCT: ${{ inputs.max-growth-pct }}
+      run: |
+        set -euo pipefail
+        if [ -z "$SDKT_WASM" ]; then
+          echo "::error::release-assurance command requires 'wasm' (path to the candidate .wasm artifact)"
+          exit 1
+        fi
+        # Variadic --audit and repeated --disable: split the space-separated
+        # inputs into individual arguments. Optional single-value flags are
+        # appended only when non-empty so CLI defaults stay in charge.
+        ARGS=(--wasm "$SDKT_WASM")
+        if [ -n "$SDKT_PREV_WASM" ]; then ARGS+=(--previous-wasm "$SDKT_PREV_WASM"); fi
+        if [ -n "$SDKT_AUDIT" ]; then
+          for path in $SDKT_AUDIT; do ARGS+=(--audit "$path"); done
+        fi
+        if [ -n "$SDKT_DISABLE" ]; then
+          for rule in $SDKT_DISABLE; do ARGS+=(--disable "$rule"); done
+        fi
+        if [ -n "$SDKT_CONTRACT" ]; then ARGS+=(--contract "$SDKT_CONTRACT"); fi
+        if [ -n "$SDKT_NETWORK" ]; then ARGS+=(--network "$SDKT_NETWORK"); fi
+        # Opt-in WASM size policy: forwarded only when the input is non-empty so
+        # the CLI's own defaults and validation stay in charge.
+        if [ -n "$SDKT_MAX_SIZE_BYTES" ]; then ARGS+=(--max-size-bytes "$SDKT_MAX_SIZE_BYTES"); fi
+        if [ -n "$SDKT_MAX_GROWTH_PCT" ]; then ARGS+=(--max-growth-pct "$SDKT_MAX_GROWTH_PCT"); fi
+        echo "Running: sdkt release-assurance ${ARGS[*]} --format json"
+        # The CLI exits non-zero both for a FAIL verdict and for an error that
+        # produced no report (bad input, unreadable artifact, RPC failure). The
+        # JSON gate alone only sees the former: on an error there is no
+        # .release_status, so it must be decided from the captured exit code.
+        OUT=$(sdkt release-assurance "${ARGS[@]}" --format json) && RC=0 || RC=$?
+        echo "$OUT"
+        STATUS=$(echo "$OUT" | jq -r '.release_status')
+        echo "Release assurance status: $STATUS (cli exit code $RC)"
+        if [ "$STATUS" = "FAIL" ]; then
+          echo "::error::sdkt release-assurance reported FAIL (see report above)"
+          exit 1
+        fi
+        if [ "$RC" -ne 0 ]; then
+          echo "::error::sdkt release-assurance failed (exit code $RC); see error above"
+          exit "$RC"
+        fi
+        echo "sdkt release-assurance passed (release_status=$STATUS)."

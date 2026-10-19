@@ -1,14 +1,17 @@
-use crate::client::SorobanRpcClient;
+use crate::client::{SorobanRpcClient, StorageResponse, MAX_LEDGER_KEYS};
 use crate::error::RpcError;
 use base64::Engine;
 use serde::Serialize;
-use stellar_xdr::{LedgerEntryData, ReadXdr, SorobanTransactionData};
+use std::collections::HashMap;
+use stellar_xdr::{LedgerEntryData, ReadXdr, SorobanTransactionData, WriteXdr};
 
 /// Storage TTL info for a contract.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TtlInfo {
     pub contract_id: String,
     pub entries: Vec<TtlEntry>,
+    #[serde(skip)]
+    pub latest_ledger: Option<u32>,
 }
 
 /// A single storage entry with human-readable TTL information.
@@ -19,6 +22,36 @@ pub struct TtlEntry {
     pub expiration_time: String,
     pub days_remaining: u32,
     pub extension_cost_stroops: u64,
+    /// `true` when `current_ttl` is below `expiring_soon_ledgers` (passed to
+    /// [`get_ttl_info_for_keys`]); used to surface TTL warnings consistently
+    /// across `StorageAnalyzer` and `sdkt storage read`. (Issue #375.)
+    pub expiring_soon: bool,
+    /// Base64 XDR `ScVal` extracted from the entry's contract-data payload.
+    /// `None` when the entry is not contract data or the XDR fails to parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// Decode a base64 `LedgerEntryData` XDR (the shape Soroban RPC returns in
+/// `getLedgerEntries.entries[].xdr`) and extract its contract-data `ScVal`
+/// (base64 XDR). Returns `None` for contract-code entries, entries whose XDR
+/// fails to parse, or entries whose payload is not contract data.
+fn extract_contract_data_value(entry_xdr: &str) -> Option<String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(entry_xdr.trim())
+        .ok()?;
+    let mut cursor = std::io::Cursor::new(&bytes);
+    let mut l = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
+    let data = stellar_xdr::LedgerEntryData::read_xdr(&mut l).ok()?;
+    let cd = match data {
+        stellar_xdr::LedgerEntryData::ContractData(cd) => cd,
+        _ => return None,
+    };
+    let mut buf = Vec::new();
+    let mut l2 = stellar_xdr::Limited::new(&mut buf, stellar_xdr::Limits::none());
+    cd.val.write_xdr(&mut l2).ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(&buf))
 }
 
 /// Calculates extension cost using a simple placeholder formula
@@ -43,31 +76,28 @@ pub(crate) fn instance_ledger_key(contract_id: &str) -> Result<String, RpcError>
         .map_err(|e| RpcError::Rpc(format!("Failed to encode instance ledger key: {e}")))
 }
 
-/// Fetches TTL info from the RPC node and transforms it into a `TtlInfo` representation.
-pub async fn get_ttl_info(
+/// Fetches TTL info from the RPC node for a contract's instance entry plus any
+/// explicit extra keys, and transforms it into a `TtlInfo` representation.
+///
+/// Validates `contract_id` and all `extra_keys` before any RPC call via
+/// [`collect_extend_keys`].
+pub async fn get_ttl_info_for_keys(
     client: &SorobanRpcClient,
     contract_id: &str,
+    extra_keys: &[String],
+    max_entries: usize,
+    expiring_soon_ledgers: u32,
 ) -> Result<TtlInfo, RpcError> {
-    let ledger_info = client.get_ledger().await?;
-    let current_ledger = ledger_info.sequence;
+    // Validate contract ID and all keys before contacting RPC.
+    let keys = collect_extend_keys(contract_id, extra_keys)?;
 
-    // Soroban RPC `getLedgerEntries` requires explicit keys — it cannot enumerate all
-    // storage for a contract. The one key that is ALWAYS present for a deployed
-    // contract is its instance singleton (see [`instance_ledger_key`]). Querying it
-    // returns the contract's instance entry (real, decodable) and avoids the
-    // "no keys specified in request" error that an empty key set causes. Further
-    // storage data entries (persistent/temporary) would require explicit keys the
-    // caller must supply; the instance entry is the guaranteed baseline.
-    let instance_key = instance_ledger_key(contract_id)?;
-
-    let storage_resp = client
-        .get_contract_storage(contract_id, &[instance_key])
-        .await?;
+    let storage_resp = fetch_ledger_entries(client, &keys, max_entries).await?;
+    let capture_ledger = storage_resp.latest_ledger;
 
     let mut entries = Vec::new();
     for entry in storage_resp.entries {
         let current_ttl = if let Some(live_until) = entry.live_until_ledger_seq {
-            live_until.saturating_sub(current_ledger)
+            live_until.saturating_sub(capture_ledger)
         } else {
             0
         };
@@ -76,19 +106,39 @@ pub async fn get_ttl_info(
         let days_remaining = (current_ttl * 5) / (24 * 3600);
         let extension_cost_stroops = calculate_extension_cost(current_ttl);
 
+        // Extract the stored `ScVal` (base64 XDR) for value-diffing. Only
+        // contract-data entries carry a value; decode failures degrade to
+        // `None` so TTL analysis never breaks on an unusual entry.
+        let value = extract_contract_data_value(&entry.xdr);
+
         entries.push(TtlEntry {
             key: entry.key,
             current_ttl,
             expiration_time: format!("~{} days", days_remaining),
             days_remaining,
             extension_cost_stroops,
+            // The expiring-soon threshold is applied here, at the point the
+            // TTL is known, so every consumer (StorageAnalyzer, `sdkt storage
+            // read`, `sdkt ttl`) sees the same flag for the same config value.
+            // (Issue #375: wired from [storage].ttl_warning_days.)
+            expiring_soon: current_ttl < expiring_soon_ledgers,
+            value,
         });
     }
 
     Ok(TtlInfo {
         contract_id: contract_id.to_string(),
         entries,
+        latest_ledger: Some(capture_ledger),
     })
+}
+
+/// Fetches TTL info from the RPC node and transforms it into a `TtlInfo` representation.
+pub async fn get_ttl_info(
+    client: &SorobanRpcClient,
+    contract_id: &str,
+) -> Result<TtlInfo, RpcError> {
+    get_ttl_info_for_keys(client, contract_id, &[], 200, 17_280).await
 }
 
 /// Result of a successful `ExtendFootprintTtl` submission.
@@ -100,6 +150,24 @@ pub struct ExtendResult {
     pub hash: String,
     pub status: String,
     pub fee: u32,
+}
+
+/// Result of a `RestoreFootprint` submission, or of a `--dry-run`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RestoreResult {
+    pub contract_id: String,
+    /// Ledger keys (base64 XDR) from the preamble footprint, read-only then read-write.
+    pub footprint_keys: Vec<String>,
+    /// Number of ledger keys the restore covers.
+    pub restored_keys: usize,
+    /// Transaction hash. `None` for a dry run, which submits nothing.
+    pub hash: Option<String>,
+    /// `SUCCESS` after a confirmed submission, `DRY_RUN` otherwise.
+    pub status: String,
+    /// Total transaction fee in stroops (inclusion fee + resource fee).
+    pub fee: u32,
+    /// `minResourceFee` reported by the restore preamble.
+    pub min_resource_fee: u32,
 }
 
 /// Parse `min_resource_fee` from simulation. Never silently default to zero.
@@ -134,6 +202,7 @@ pub fn collect_extend_keys(
 /// at least `extend_to` ledgers past the last closed ledger. It is passed to
 /// the operation unchanged; adding the current ledger would overshoot and
 /// exceed the network's maximum TTL.
+#[allow(clippy::too_many_arguments)]
 pub async fn extend_footprint(
     client: &SorobanRpcClient,
     contract_id: &str,
@@ -142,6 +211,7 @@ pub async fn extend_footprint(
     source_account: &str,
     signer: &sdkt_xdr::sign::Ed25519Signer,
     network: sdkt_xdr::sign::Network,
+    poll: &crate::submission::PollConfig,
 ) -> Result<ExtendResult, RpcError> {
     if extend_to == 0 {
         return Err(RpcError::Rpc(
@@ -195,14 +265,8 @@ pub async fn extend_footprint(
     let signed_envelope = sdkt_xdr::sign_transaction(&final_envelope, signer, &signing_opts)
         .map_err(|e| RpcError::Rpc(format!("Failed to sign extend transaction: {e}")))?;
 
-    let submission = crate::submission::submit_and_wait(
-        client,
-        &signed_envelope,
-        true,
-        &crate::submission::PollConfig::default(),
-    )
-    .await?;
-
+    let submission =
+        crate::submission::submit_and_wait(client, &signed_envelope, true, poll).await?;
     if submission.status != crate::submission::TransactionStatus::Success {
         let code = submission.error_code.as_deref().unwrap_or("unknown");
         let diag = submission.error_result_xdr.as_deref().unwrap_or("");
@@ -221,6 +285,167 @@ pub async fn extend_footprint(
     })
 }
 
+/// Inclusion fee added on top of the resource fee, matching `extend_footprint`.
+const RESTORE_INCLUSION_FEE: u32 = 100;
+
+/// Turn a simulation's `restorePreamble` into `RestoreFootprint` parameters.
+///
+/// Pure: no network access. The preamble's `transactionData` is adopted as-is
+/// (authoritative footprint and resource bounds), except that its
+/// `resource_fee` is raised to `minResourceFee` if it is lower, so the fee
+/// floor always holds. Returns the parameters and the reported
+/// `minResourceFee`.
+///
+/// # Errors
+/// Returns an actionable [`RpcError`] when there is no preamble (state is
+/// live), when the preamble is malformed, or when its footprint is empty.
+pub fn restore_params_from_simulation(
+    simulation: &crate::simulate::SimulateResponse,
+    source_account: &str,
+    sequence: i64,
+) -> Result<(sdkt_xdr::RestoreFootprintParams, u32), RpcError> {
+    let Some(preamble) = &simulation.restore_preamble else {
+        return Err(RpcError::Rpc(match &simulation.error {
+            Some(err) => {
+                format!("Nothing to restore: simulation failed without a restore preamble: {err}")
+            }
+            None => "Nothing to restore: simulation returned no restore preamble, \
+                     so the contract state this invocation touches is live"
+                .into(),
+        }));
+    };
+
+    let mut soroban_data: SorobanTransactionData =
+        sdkt_xdr::parse_soroban_transaction_data(&preamble.transaction_data).map_err(|e| {
+            RpcError::Rpc(format!(
+                "Restore preamble transactionData is malformed ({e}); \
+                 re-run the simulation against a healthy RPC node"
+            ))
+        })?;
+
+    let footprint = &soroban_data.resources.footprint;
+    if footprint.read_only.is_empty() && footprint.read_write.is_empty() {
+        return Err(RpcError::Rpc(
+            "Restore preamble footprint is empty: no archived entries to restore".into(),
+        ));
+    }
+
+    let min_resource_fee = parse_min_resource_fee(&preamble.min_resource_fee)?;
+    if soroban_data.resource_fee < i64::from(min_resource_fee) {
+        soroban_data.resource_fee = i64::from(min_resource_fee);
+    }
+    let resource_fee = u32::try_from(soroban_data.resource_fee).map_err(|_| {
+        RpcError::Rpc(format!(
+            "Restore preamble resource fee out of range: {}",
+            soroban_data.resource_fee
+        ))
+    })?;
+
+    let params = sdkt_xdr::RestoreFootprintParams {
+        source_account: source_account.to_string(),
+        sequence,
+        fee: RESTORE_INCLUSION_FEE.saturating_add(resource_fee),
+        soroban_data,
+    };
+    Ok((params, min_resource_fee))
+}
+
+/// Restore archived contract storage via `RestoreFootprint`.
+///
+/// Simulates `invocation_envelope` (typically the invocation that failed on
+/// archived state) to obtain its `restorePreamble`, then builds a
+/// `RestoreFootprint` transaction from the preamble's footprint and fee. With
+/// `dry_run` the transaction is built but neither signed nor submitted;
+/// otherwise it is signed and submitted, waiting for confirmation like
+/// `extend_footprint`.
+#[allow(clippy::too_many_arguments)]
+pub async fn restore_footprint(
+    client: &SorobanRpcClient,
+    contract_id: &str,
+    invocation_envelope: &str,
+    source_account: &str,
+    signer: &sdkt_xdr::sign::Ed25519Signer,
+    network: sdkt_xdr::sign::Network,
+    dry_run: bool,
+    poll: &crate::submission::PollConfig,
+) -> Result<RestoreResult, RpcError> {
+    let simulation = crate::simulate::simulate_transaction(client, invocation_envelope)
+        .await
+        .map_err(|e| RpcError::Rpc(format!("Restore simulation failed: {e}")))?;
+
+    let sequence = crate::account::get_next_sequence(client, source_account).await?;
+    let (params, min_resource_fee) =
+        restore_params_from_simulation(&simulation, source_account, sequence)?;
+    let footprint_keys = extract_footprint_keys(&params.soroban_data)?;
+
+    let envelope = sdkt_xdr::build_restore_footprint_tx(&params)
+        .map_err(|e| RpcError::Rpc(format!("Failed to build restore transaction: {e}")))?;
+
+    let mut result = RestoreResult {
+        contract_id: contract_id.to_string(),
+        restored_keys: footprint_keys.len(),
+        footprint_keys,
+        hash: None,
+        status: "DRY_RUN".into(),
+        fee: params.fee,
+        min_resource_fee,
+    };
+    if dry_run {
+        return Ok(result);
+    }
+
+    let signing_opts = sdkt_xdr::sign::SigningOptions::with(network);
+    let signed_envelope = sdkt_xdr::sign_transaction(&envelope, signer, &signing_opts)
+        .map_err(|e| RpcError::Rpc(format!("Failed to sign restore transaction: {e}")))?;
+
+    let submission =
+        crate::submission::submit_and_wait(client, &signed_envelope, true, poll).await?;
+    if submission.status != crate::submission::TransactionStatus::Success {
+        let code = submission.error_code.as_deref().unwrap_or("unknown");
+        let diag = submission.error_result_xdr.as_deref().unwrap_or("");
+        return Err(RpcError::Rpc(format!(
+            "Restore transaction failed: code={code} {diag}"
+        )));
+    }
+
+    result.hash = Some(submission.hash);
+    result.status = "SUCCESS".into();
+    Ok(result)
+}
+
+/// Encode the footprint's ledger keys (read-only, then read-write) as base64 XDR.
+fn extract_footprint_keys(soroban_data: &SorobanTransactionData) -> Result<Vec<String>, RpcError> {
+    use stellar_xdr::{Limits, WriteXdr};
+    let footprint = &soroban_data.resources.footprint;
+    footprint
+        .read_only
+        .iter()
+        .chain(footprint.read_write.iter())
+        .map(|key| {
+            key.to_xdr(Limits::none())
+                .map(|raw| base64::engine::general_purpose::STANDARD.encode(raw))
+                .map_err(|e| RpcError::Rpc(format!("Failed to encode LedgerKey: {e}")))
+        })
+        .collect()
+}
+
+/// Check whether a contract is live on-chain at `contract_id`.
+///
+/// Uses the cheapest possible existence probe: a single `getLedgerEntries`
+/// call for the contract's instance singleton key (see [`instance_ledger_key`]).
+/// Returns `Ok(true)` when the ledger responds with the instance entry and
+/// `Ok(false)` when the entry is absent. This is the on-chain verification used
+/// by `sdkt project deploy --skip-deployed` so a stale `.sdkt-deployments.json`
+/// entry (contract deleted / never existed) does not cause a skip.
+pub async fn contract_exists(
+    client: &SorobanRpcClient,
+    contract_id: &str,
+) -> Result<bool, RpcError> {
+    let key = instance_ledger_key(contract_id)?;
+    let response = client.get_contract_storage("", &[key]).await?;
+    Ok(!response.entries.is_empty())
+}
+
 /// Read a single ledger entry by its `LedgerKey` (base64 XDR).
 ///
 /// Calls `getLedgerEntries` and returns the decoded `LedgerEntry`. If the
@@ -229,6 +454,77 @@ pub async fn read_ledger_entry(
     client: &SorobanRpcClient,
     key_b64: &str,
 ) -> Result<stellar_xdr::LedgerEntry, RpcError> {
+    read_ledger_entry_with_ttl(client, key_b64)
+        .await
+        .map(|(entry, _)| entry)
+}
+
+/// Fetch the current ledger entries for a set of keys, preserving per-entry
+/// provenance (`lastModifiedLedgerSeq`, `liveUntilLedgerSeq`).
+///
+/// `max_entries` is the effective per-request batch size. It is clamped to
+/// `1..=MAX_LEDGER_KEYS` (the node's hard cap) and applied to **every**
+/// request, including follow-up batches — a value of `0` means
+/// [`MAX_LEDGER_KEYS`]. Sets of at most `max_entries` keys use one request with
+/// unchanged response semantics, including an empty set. Larger sets use
+/// sequential batches of at most that many keys, with found entries returned in
+/// the requested key order (including repeated keys); absent entries are
+/// omitted. A failed batch returns an error rather than partial results.
+///
+/// This is the state-capture primitive for a state-matched differential run.
+/// It reads **current** ledger state — the RPC has no ledger-pinning
+/// parameter — so callers must verify consistency against the simulation
+/// ledger themselves (see `sdkt_fuzz::state_capture`). All batches must report
+/// the same `latestLedger`; otherwise this function fails rather than attributing
+/// entries from different ledgers to a single snapshot.
+pub async fn fetch_ledger_entries(
+    client: &SorobanRpcClient,
+    keys: &[String],
+    max_entries: usize,
+) -> Result<StorageResponse, RpcError> {
+    // Clamp once, up front: a configured batch larger than the node cap would
+    // make the first request fail with TooManyLedgerKeys, and a zero value
+    // would make `chunks` panic.
+    let batch_size = if max_entries == 0 {
+        MAX_LEDGER_KEYS
+    } else {
+        max_entries.min(MAX_LEDGER_KEYS)
+    };
+    if keys.len() <= batch_size {
+        return client.get_contract_storage("", keys).await;
+    }
+
+    let (first_batch, remaining) = keys.split_at(batch_size);
+    let mut result = client.get_contract_storage("", first_batch).await?;
+    let mut entries = HashMap::new();
+    for entry in result.entries.drain(..) {
+        entries.insert(entry.key.clone(), entry);
+    }
+
+    for batch in remaining.chunks(batch_size) {
+        let response = client.get_contract_storage("", batch).await?;
+        if response.latest_ledger != result.latest_ledger {
+            return Err(RpcError::Rpc(format!(
+                "getLedgerEntries batches span different ledgers ({} and {}); retry the complete read",
+                result.latest_ledger, response.latest_ledger
+            )));
+        }
+        for entry in response.entries {
+            entries.insert(entry.key.clone(), entry);
+        }
+    }
+
+    result.entries = keys
+        .iter()
+        .filter_map(|key| entries.get(key).cloned())
+        .collect();
+    Ok(result)
+}
+
+async fn read_ledger_entry_with_ttl(
+    client: &SorobanRpcClient,
+    key_b64: &str,
+) -> Result<(stellar_xdr::LedgerEntry, Option<u32>), RpcError> {
     let keys = vec![key_b64.to_string()];
     let response = client.get_contract_storage("", &keys).await?;
 
@@ -238,15 +534,18 @@ pub async fn read_ledger_entry(
         ));
     }
 
-    let entry_xdr = &response.entries[0].xdr;
+    let result = &response.entries[0];
+    let live_until_ledger = result.live_until_ledger_seq;
+    let entry_xdr = &result.xdr;
     let entry_bytes = base64::engine::general_purpose::STANDARD
         .decode(entry_xdr.trim())
         .map_err(|e| RpcError::Rpc(format!("Failed to decode LedgerEntry XDR: {e}")))?;
 
     let mut cursor = std::io::Cursor::new(&entry_bytes);
     let mut l = stellar_xdr::Limited::new(&mut cursor, stellar_xdr::Limits::none());
-    stellar_xdr::LedgerEntry::read_xdr(&mut l)
-        .map_err(|e| RpcError::Rpc(format!("Failed to parse LedgerEntry: {e}")))
+    let entry = stellar_xdr::LedgerEntry::read_xdr(&mut l)
+        .map_err(|e| RpcError::Rpc(format!("Failed to parse LedgerEntry: {e}")))?;
+    Ok((entry, live_until_ledger))
 }
 
 /// Result of a successful `storage read` call.
@@ -282,7 +581,7 @@ pub async fn read_contract_state(
         .map_err(|e| RpcError::Rpc(format!("Failed to re-encode LedgerKey: {e}")))?;
     let canonical_key_b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
 
-    let entry = read_ledger_entry(client, &canonical_key_b64).await?;
+    let (entry, live_until_ledger) = read_ledger_entry_with_ttl(client, &canonical_key_b64).await?;
 
     let (entry_type, durability, value_json) = match &entry.data {
         LedgerEntryData::ContractData(cd) => {
@@ -338,7 +637,7 @@ pub async fn read_contract_state(
         entry_type,
         durability,
         value: value_json,
-        live_until_ledger: None,
+        live_until_ledger,
     })
 }
 
@@ -458,6 +757,99 @@ mod tests {
         assert!(collect_extend_keys("not-a-contract", &[]).is_err());
     }
 
+    #[tokio::test]
+    async fn test_get_ttl_info_for_keys_rejects_invalid_key_before_rpc() {
+        // Point to an invalid/unreachable address. If validation happens before RPC,
+        // it fails immediately with invalid LedgerKey error, not a connection error.
+        let client = SorobanRpcClient::new("http://127.0.0.1:1");
+        let result = get_ttl_info_for_keys(
+            &client,
+            "CAE3U7JKESRWZHPEQ72DVNGOQ6WPA7HSPQZL5YV46NPCE4TMUPAGYMEC",
+            &["not-a-valid-key".to_string()],
+            200,
+            17_280,
+        )
+        .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("invalid LedgerKey"));
+    }
+
+    #[tokio::test]
+    async fn test_contract_exists_checks_on_chain_not_record_file() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        // Mock `getLedgerEntries` that returns an entry (contract live).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}");
+
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut sock = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 16384];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if req.contains("getLedgerEntries") {
+                    let entry = "AAAAAQAAAABpc25nAAAA".to_string();
+                    format!(
+                        r#"{{"jsonrpc":"2.0","id":1,"result":{{"entries":[{{"key":"AAAAAA==","xdr":"{entry}","lastModifiedLedgerSeq":1}}],"latestLedger":100}}}}"#
+                    )
+                } else {
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}"#
+                        .to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let c = "CAE3U7JKESRWZHPEQ72DVNGOQ6WPA7HSPQZL5YV46NPCE4TMUPAGYMEC";
+        let client = crate::SorobanRpcClient::new(&url);
+        assert!(
+            contract_exists(&client, c).await.unwrap(),
+            "instance entry present at recorded address -> exists"
+        );
+
+        // Mock that serves an empty entries array -> recorded contract is gone.
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let url2 = format!("http://{addr2}");
+        thread::spawn(move || {
+            for conn in listener2.incoming() {
+                let mut sock = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 16384];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let _req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"entries":[],"latestLedger":100}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let client2 = crate::SorobanRpcClient::new(&url2);
+        assert!(
+            !contract_exists(&client2, c).await.unwrap(),
+            "empty entries at recorded address -> contract no longer exists"
+        );
+    }
+
     #[test]
     fn test_extend_result_json_is_valid_and_contains_key_fields() {
         // Verifies the structured JSON the CLI emits for `--format json`.
@@ -487,5 +879,182 @@ mod tests {
 
         let keys = parsed["footprint_keys"].as_array().unwrap();
         assert_eq!(keys.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use crate::simulate::SimulateResponse;
+    use stellar_xdr::{
+        ContractDataDurability, ContractId, Hash, LedgerFootprint, LedgerKey,
+        LedgerKeyContractData, Limits, ScAddress, ScVal, SorobanResources,
+        SorobanTransactionDataExt, VecM, WriteXdr,
+    };
+
+    const SOURCE: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    fn preamble_data(read_write: Vec<LedgerKey>, resource_fee: i64) -> String {
+        let data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: VecM::try_from(read_write).unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 1_000,
+                write_bytes: 1_000,
+            },
+            resource_fee,
+        };
+        base64::engine::general_purpose::STANDARD.encode(data.to_xdr(Limits::none()).unwrap())
+    }
+
+    fn instance_key() -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([7; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        })
+    }
+
+    fn simulation(preamble: Option<(&str, &str)>, error: Option<&str>) -> SimulateResponse {
+        let mut v = serde_json::json!({ "latestLedger": 100 });
+        if let Some((data, fee)) = preamble {
+            v["restorePreamble"] = serde_json::json!({
+                "transactionData": data,
+                "minResourceFee": fee,
+            });
+        }
+        if let Some(err) = error {
+            v["error"] = serde_json::json!(err);
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn adopts_preamble_footprint_unchanged() {
+        let data = preamble_data(vec![instance_key()], 5_000);
+        let sim = simulation(Some((&data, "5000")), None);
+        let (params, min_fee) = restore_params_from_simulation(&sim, SOURCE, 42).unwrap();
+
+        assert_eq!(min_fee, 5_000);
+        assert_eq!(params.sequence, 42);
+        assert_eq!(params.fee, RESTORE_INCLUSION_FEE + 5_000);
+        let expected = sdkt_xdr::parse_soroban_transaction_data(&data).unwrap();
+        assert_eq!(params.soroban_data, expected);
+    }
+
+    #[test]
+    fn raises_resource_fee_to_min_resource_fee() {
+        let data = preamble_data(vec![instance_key()], 1_000);
+        let sim = simulation(Some((&data, "7500")), None);
+        let (params, _) = restore_params_from_simulation(&sim, SOURCE, 1).unwrap();
+
+        assert_eq!(params.soroban_data.resource_fee, 7_500);
+        assert_eq!(params.fee, RESTORE_INCLUSION_FEE + 7_500);
+    }
+
+    #[test]
+    fn missing_preamble_means_nothing_to_restore() {
+        let err = restore_params_from_simulation(&simulation(None, None), SOURCE, 1).unwrap_err();
+        assert!(err.to_string().contains("Nothing to restore"), "{err}");
+        assert!(err.to_string().contains("live"), "{err}");
+    }
+
+    #[test]
+    fn missing_preamble_surfaces_simulation_error() {
+        let sim = simulation(None, Some("HostError: bad arg"));
+        let err = restore_params_from_simulation(&sim, SOURCE, 1).unwrap_err();
+        assert!(err.to_string().contains("HostError: bad arg"), "{err}");
+    }
+
+    #[test]
+    fn empty_preamble_footprint_is_rejected() {
+        let data = preamble_data(vec![], 100);
+        let sim = simulation(Some((&data, "100")), None);
+        let err = restore_params_from_simulation(&sim, SOURCE, 1).unwrap_err();
+        assert!(err.to_string().contains("footprint is empty"), "{err}");
+    }
+
+    #[test]
+    fn malformed_preamble_is_rejected() {
+        let sim = simulation(Some(("not-xdr", "100")), None);
+        let err = restore_params_from_simulation(&sim, SOURCE, 1).unwrap_err();
+        assert!(err.to_string().contains("malformed"), "{err}");
+    }
+
+    #[test]
+    fn footprint_keys_are_base64_ledger_keys() {
+        let data = preamble_data(vec![instance_key()], 100);
+        let parsed = sdkt_xdr::parse_soroban_transaction_data(&data).unwrap();
+        let keys = extract_footprint_keys(&parsed).unwrap();
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(instance_key().to_xdr(Limits::none()).unwrap());
+        assert_eq!(keys, vec![expected]);
+    }
+
+    /// `extract_contract_data_value` must decode the wire shape Soroban RPC
+    /// actually returns in `getLedgerEntries.entries[].xdr`: a bare
+    /// `LedgerEntryData` union (the testnet layout), NOT a full `LedgerEntry`.
+    /// Regression guard for the value-drift path: a wrong envelope decode
+    /// returns None and silently drops every value from snapshots/diffs.
+    #[test]
+    fn extract_contract_data_value_decodes_rpc_ledger_entry_data() {
+        use stellar_xdr::{ScVal, WriteXdr};
+        let cd = stellar_xdr::ContractDataEntry {
+            contract: stellar_xdr::ScAddress::Contract(stellar_xdr::ContractId(stellar_xdr::Hash(
+                [7u8; 32],
+            ))),
+            key: ScVal::I32(42),
+            val: ScVal::I32(43),
+            durability: stellar_xdr::ContractDataDurability::Persistent,
+            ext: stellar_xdr::ExtensionPoint::V0,
+        };
+        let data = stellar_xdr::LedgerEntryData::ContractData(cd);
+        let raw = data
+            .to_xdr(Limits::none())
+            .expect("LedgerEntryData encodes to XDR");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+
+        let got = extract_contract_data_value(&b64)
+            .expect("RPC-shaped LedgerEntryData must decode to a value");
+
+        // The returned base64 must decode back to the original ScVal.
+        let got_bytes = base64::engine::general_purpose::STANDARD
+            .decode(got)
+            .expect("value must be base64 XDR");
+        let mut cursor = std::io::Cursor::new(&got_bytes);
+        let mut l = stellar_xdr::Limited::new(&mut cursor, Limits::none());
+        let val = ScVal::read_xdr(&mut l).expect("value must decode to ScVal");
+        assert_eq!(val, ScVal::I32(43));
+    }
+
+    #[test]
+    fn extract_contract_data_value_rejects_non_contract_data() {
+        use stellar_xdr::{AccountId, WriteXdr};
+        let data = stellar_xdr::LedgerEntryData::Account(stellar_xdr::AccountEntry {
+            account_id: AccountId(stellar_xdr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::Uint256([1u8; 32]),
+            )),
+            balance: 100,
+            seq_num: stellar_xdr::SequenceNumber(0),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: stellar_xdr::String32::default(),
+            thresholds: stellar_xdr::Thresholds([0u8; 4]),
+            signers: stellar_xdr::VecM::default(),
+            ext: stellar_xdr::AccountEntryExt::V0,
+        });
+        let raw = data
+            .to_xdr(Limits::none())
+            .expect("LedgerEntryData encodes to XDR");
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+        assert!(
+            extract_contract_data_value(&b64).is_none(),
+            "non-contract-data entries carry no value"
+        );
     }
 }
